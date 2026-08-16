@@ -1296,6 +1296,46 @@ async def _vision_analyze_native(
                 pass
 
 
+_LOCAL_OCR_MIN_CHARS = 10  # rapidocr fast-path: skip if fewer meaningful chars
+
+
+def _run_rapidocr_ocr(image_path: str) -> Optional[str]:
+    """Run local rapidocr OCR via system Python 3.10 (not available in venv).
+
+    User's OCR of choice (2026-08-16): rapidocr_onnxruntime under
+    /usr/bin/python3.10 — NOT EasyOCR/Tesseract (not installed here).
+    Returns extracted text (newline-joined lines) or None on failure/empty.
+    """
+    import subprocess
+
+    if not image_path or not os.path.exists(image_path):
+        return None
+    code = (
+        "import sys\n"
+        "from rapidocr_onnxruntime import RapidOCR\n"
+        "r = RapidOCR()\n"
+        "res, _ = r(sys.argv[1])\n"
+        "if not res:\n"
+        "    sys.exit(2)\n"
+        "print('\\n'.join(x[1].strip() for x in res if x[1].strip()))\n"
+    )
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/python3.10", "-c", code, image_path],
+            capture_output=True, text=True, timeout=60,
+        )
+        if proc.returncode != 0:
+            logger.debug("rapidocr subprocess rc=%s: %s", proc.returncode, proc.stderr[:200])
+            return None
+        text = proc.stdout.strip()
+        if len(text) < _LOCAL_OCR_MIN_CHARS:
+            return None
+        return text
+    except Exception as exc:
+        logger.debug("rapidocr OCR failed: %s", exc)
+        return None
+
+
 async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
@@ -1426,6 +1466,30 @@ async def vision_analyze_tool(
             temp_image_path = cropped_path
             detected_mime_type = cropped_mime
             should_cleanup = True
+
+        # ── Local OCR fast-path (2026-08-16, user request) ──
+        # Try rapidocr FIRST: for text-heavy images (logs, screenshots, tables)
+        # this returns in ~1-3s instead of the 10-60s vision model call.
+        # Only falls through to the vision model when OCR yields no meaningful
+        # text (e.g. pure images/photos).
+        if region is None:  # OCR is not region-aware; skip when cropped
+            try:
+                ocr_text = await asyncio.to_thread(_run_rapidocr_ocr, str(temp_image_path))
+            except Exception as _ocr_err:
+                logger.debug("local OCR fast-path error: %s", _ocr_err)
+                ocr_text = None
+            if ocr_text:
+                logger.info("Local OCR (rapidocr) extracted %d chars; skipping vision model", len(ocr_text))
+                ocr_result = {
+                    "success": True,
+                    "analysis": "[Text extracted by local OCR]\n\n" + ocr_text,
+                }
+                debug_call_data["success"] = True
+                debug_call_data["analysis_length"] = len(ocr_text)
+                debug_call_data["model_used"] = "local-ocr:rapidocr"
+                _debug.log_call("vision_analyze_tool", debug_call_data)
+                _debug.save()
+                return json.dumps(ocr_result, indent=2, ensure_ascii=False)
 
         # Convert image to base64 — send at full resolution first.
         # If the provider rejects it as too large, we auto-resize and retry.
