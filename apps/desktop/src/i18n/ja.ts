@@ -876,7 +876,12 @@ export const ja = defineLocale({
       unsavedConnect: '未保存 — 接続するには mcp.json を保存してください。',
       enableTool: tool => `${tool} を有効化`,
       disableTool: tool => `${tool} を無効化`,
-      noOutput: 'まだ出力がありません。'
+      noOutput: 'まだ出力がありません。',
+      importButton: 'インポート',
+      importPlaceholder: 'mcp.json スニペット、npx/docker コマンド、claude mcp add 行、URL、Cursor リンクを貼り付け…',
+      importNoMatch: '貼り付けたテキストからサーバー設定を認識できませんでした。',
+      importConfirm: 'mcp.json に追加',
+      importConfirmMany: count => `${count} 件のサーバーを mcp.json に追加`
     },
     model: {
       loading: 'モデル設定を読み込み中...',
