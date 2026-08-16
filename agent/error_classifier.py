@@ -1237,10 +1237,20 @@ def _classify_by_status(
         # server_error" rule turns one bad request into a retry flood.
         # Detect the unambiguous request-validation signals (in either the
         # message text or the structured error code) and fail fast.
+        # k6 local policy (ported 2026-08-15): some relay gateways incorrectly
+        # label an upstream WebSocket transport outage as ``invalid_request_error``.
+        # It is transient, so keep it on the normal retry path and honor api_max_retries.
+        _upstream_websocket_outage = (
+            ("无法连接到上游" in error_msg and "websocket" in error_msg)
+            or ("cannot connect to upstream" in error_msg and "websocket" in error_msg)
+        )
         if (
-            any(p in error_msg for p in _REQUEST_VALIDATION_PATTERNS)
-            or error_code.lower() in {"invalid_request_error", "unknown_parameter",
-                                      "unsupported_parameter"}
+            not _upstream_websocket_outage
+            and (
+                any(p in error_msg for p in _REQUEST_VALIDATION_PATTERNS)
+                or error_code.lower() in {"invalid_request_error", "unknown_parameter",
+                                          "unsupported_parameter"}
+            )
         ):
             return result_fn(
                 FailoverReason.format_error,

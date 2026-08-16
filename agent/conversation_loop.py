@@ -5504,21 +5504,13 @@ def run_conversation(
                 # (real-world: ~$40 in 48h on a 24/7 gateway).  Aborting
                 # mirrors how 401/403 (also ``should_fallback=True``)
                 # already behave once their recovery paths have failed.
-                is_client_error = (
-                    is_local_validation_error
-                    or (
-                        not classified.retryable
-                        and not classified.should_compress
-                        and classified.reason not in {
-                            FailoverReason.rate_limit,
-                            FailoverReason.overloaded,
-                            FailoverReason.context_overflow,
-                            FailoverReason.payload_too_large,
-                            FailoverReason.long_context_tier,
-                            FailoverReason.thinking_signature,
-                        }
-                    )
-                ) and not is_context_length_error
+                # k6 user policy (ported 2026-08-15): every model API-call failure,
+                # including 4xx/5xx, auth, format, and transport errors, enters the
+                # common retry loop and is limited by agent.api_max_retries.
+                # This intentionally disables terminal classification here;
+                # fallback activation remains handled by the retry exhaustion
+                # path after the configured attempts.
+                is_client_error = False
 
                 if is_client_error:
                     # Copilot self-heal BEFORE fallback: a stale/degraded
