@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import time
+from collections import Counter
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
@@ -731,7 +732,7 @@ class BatchRunner:
         else:
             atomic_json_write(self.checkpoint_file, checkpoint_data)
     
-    def _scan_completed_prompts_by_content(self) -> set:
+    def _scan_completed_prompts_by_content(self) -> Counter:
         """
         Scan all batch files and extract completed prompts by their actual content.
         
@@ -739,9 +740,12 @@ class BatchRunner:
         rather than indices, allowing recovery even if indices don't match.
         
         Returns:
-            set: Set of prompt texts that have been successfully processed
+            Counter: prompt text -> number of successfully processed occurrences.
+            local fix 2026.8.16: count occurrences (not a set) so duplicate
+            prompts in the dataset are not silently dropped on --resume
+            (upstream #86523)
         """
-        completed_prompts = set()
+        completed_prompts = Counter()
         batch_files = sorted(self.output_dir.glob("batch_*.jsonl"))
         
         if not batch_files:
@@ -766,7 +770,7 @@ class BatchRunner:
                                 if msg.get("from") == "human":
                                     prompt_text = msg.get("value", "").strip()
                                     if prompt_text:
-                                        completed_prompts.add(prompt_text)
+                                        completed_prompts[prompt_text] += 1
                                     break  # Only need the first human message
                         except json.JSONDecodeError:
                             continue
@@ -775,12 +779,12 @@ class BatchRunner:
         
         return completed_prompts
     
-    def _filter_dataset_by_completed(self, completed_prompts: set) -> Tuple[List[Dict], List[int]]:
+    def _filter_dataset_by_completed(self, completed_prompts: Counter) -> Tuple[List[Dict], List[int]]:
         """
         Filter the dataset to exclude prompts that have already been completed.
         
         Args:
-            completed_prompts: Set of prompt texts that have been completed
+            completed_prompts: Counter of prompt text -> completed occurrences
             
         Returns:
             Tuple of (filtered_dataset, skipped_indices)
@@ -801,7 +805,11 @@ class BatchRunner:
                         prompt_text = (msg.get("content") or msg.get("value", "")).strip()
                         break
             
-            if prompt_text in completed_prompts:
+            # local fix 2026.8.16: skip only as many rows per prompt text as
+            # were actually completed (decrementing), so duplicate prompts
+            # beyond the completed count are still processed (upstream #86523)
+            if completed_prompts.get(prompt_text, 0) > 0:
+                completed_prompts[prompt_text] -= 1
                 skipped_indices.append(idx)
             else:
                 # Keep original index for tracking
@@ -1244,17 +1252,20 @@ def main(
         return
     
     # Validate required arguments
+    # local fix 2026.8.16: fire.Fire does not propagate main()'s return value
+    # as the process exit code, so failure paths must raise SystemExit to
+    # avoid looking like success to CI/schedulers (upstream #86524)
     if not dataset_file:
         print("❌ Error: --dataset_file is required")
-        return
+        raise SystemExit(1)
     
     if not batch_size or batch_size < 1:
         print("❌ Error: --batch_size must be a positive integer")
-        return
+        raise SystemExit(1)
     
     if not run_name:
         print("❌ Error: --run_name is required")
-        return
+        raise SystemExit(1)
     
     # Parse provider preferences (comma-separated strings to lists)
     providers_allowed_list = [p.strip() for p in providers_allowed.split(",")] if providers_allowed else None
@@ -1273,7 +1284,7 @@ def main(
         valid_efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
         if reasoning_effort not in valid_efforts:
             print(f"❌ Error: --reasoning_effort must be one of: {', '.join(valid_efforts)}")
-            return
+            raise SystemExit(1)  # local fix 2026.8.16: exit non-zero on failure (upstream #86524)
         reasoning_config = {"enabled": True, "effort": reasoning_effort}
         print(f"🧠 Reasoning effort: {reasoning_effort}")
     
@@ -1285,11 +1296,11 @@ def main(
                 prefill_messages = json.load(f)
             if not isinstance(prefill_messages, list):
                 print("❌ Error: prefill_messages_file must contain a JSON array of messages")
-                return
+                raise SystemExit(1)  # local fix 2026.8.16: exit non-zero on failure (upstream #86524)
             print(f"💬 Loaded {len(prefill_messages)} prefill messages from {prefill_messages_file}")
         except Exception as e:
             print(f"❌ Error loading prefill messages: {e}")
-            return
+            raise SystemExit(1)  # local fix 2026.8.16: exit non-zero on failure (upstream #86524)
     
     # Initialize and run batch runner
     try:
@@ -1322,7 +1333,10 @@ def main(
         print(f"\n❌ Fatal error: {e}")
         if verbose:
             traceback.print_exc()
-        return 1
+        # local fix 2026.8.16: SystemExit propagates through fire.Fire with
+        # its code; "return 1" would be swallowed and the process would exit 0
+        # (upstream #86524)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

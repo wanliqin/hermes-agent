@@ -976,6 +976,10 @@ def _cleanup_all_browsers(*args, **kwargs):
 
 # Guard to prevent cleanup from running multiple times on exit
 _cleanup_done = False
+# local fix 2026.8.16: set when _run_cleanup starts so a signal-armed exit
+# watchdog yields to cleanup's own tighter timer instead of hard-killing
+# cleanup mid-flight (upstream #86525)
+_cleanup_started = False
 _cli_wake_owner = None
 # One-shot CLI finalization runs before process cleanup so plugins can observe
 # the session boundary while the agent is still attached. If a signal lands in
@@ -1050,7 +1054,7 @@ def _prepare_deferred_agent_startup() -> None:
             exc_info=True,
         )
 
-def _arm_exit_watchdog(timeout_s: float | None = None) -> None:
+def _arm_exit_watchdog(timeout_s: float | None = None, *, from_signal: bool = False) -> None:
     """Guarantee the process actually exits once shutdown has begun.
 
     Two hang classes have kept "dead" CLI processes alive for minutes:
@@ -1086,6 +1090,12 @@ def _arm_exit_watchdog(timeout_s: float | None = None) -> None:
 
     def _watchdog():
         time.sleep(timeout_s)
+        # local fix 2026.8.16: a signal-armed watchdog must not fire once
+        # _run_cleanup has started — cleanup arms its own tighter timer, so
+        # this outer timer yields instead of hard-killing cleanup mid-flight
+        # (upstream #86525)
+        if from_signal and _cleanup_started:
+            return
         # Still alive — cleanup or interpreter teardown is wedged.
         try:
             logger.warning(
@@ -1154,17 +1164,21 @@ def _arm_exit_watchdog_on_shutdown_signal() -> None:
     if base <= 0:
         return  # explicitly disabled
     try:
-        _arm_exit_watchdog(timeout_s=base * 2)
+        _arm_exit_watchdog(timeout_s=base * 2, from_signal=True)
     except Exception:
         pass  # never let the backstop break signal handling
 
 
 def _run_cleanup(*, notify_session_finalize: bool = True):
     """Run resource cleanup exactly once."""
-    global _cleanup_done
+    global _cleanup_done, _cleanup_started
     if _cleanup_done:
         return
     _cleanup_done = True
+    # local fix 2026.8.16: mark cleanup as started BEFORE arming our own
+    # watchdog so the earlier signal-armed watchdog (2x leash) disarms itself
+    # and lets this tighter timer be the backstop (upstream #86525)
+    _cleanup_started = True
 
     # Bound total shutdown time: if cleanup (or the interpreter's
     # thread-join teardown after it) wedges, force-exit instead of
