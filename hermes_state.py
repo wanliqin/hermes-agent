@@ -1201,7 +1201,12 @@ def _apply_delete_for_wal_reset_bug(
                 "this process does not exclusively own"
             )
         _log_wal_reset_bug_once(db_label, kept_wal=True, indeterminate=True)
-        return "wal"
+        # local fix 2026.8.16: report "delete", not "wal", for the
+        # indeterminate probe — claiming "wal" would set _wal_active=True and
+        # enable the lock-free read pool on a DB that may be in rollback-
+        # journal mode (raw SQLITE_BUSY on reads); claiming "delete" only
+        # costs queuing on the write lock (upstream #86515)
+        return "delete"
 
     actual = ""
     try:
@@ -3265,28 +3270,41 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         conn = self._checkout_read_conn()
         if conn is not None:
+            broken = False
             try:
                 yield conn
+            except sqlite3.DatabaseError:
+                # local fix 2026.8.16: a DatabaseError marks the pooled read
+                # connection as broken or stale (backing file replaced /
+                # truncated — the same scenario _reconnect_after_notadb
+                # self-heals on the write side). Destroy it instead of
+                # returning it to the pool so the next checkout reopens
+                # (upstream #86518)
+                broken = True
+                raise
             finally:
-                returned = False
-                with self._read_conns_lock:
-                    if not self._read_conns_closed:
-                        try:
-                            self._read_pool.put_nowait(conn)
-                            returned = True
-                        except queue.Full:
-                            pass
-                if not returned:
-                    # close() has already drained the pool, so this connection
-                    # is surplus. Close it here — dropping it on the floor is
-                    # what leaked the fd.
-                    #
-                    # queue.Full is now unreachable in practice (permits and
-                    # maxsize are both _READ_POOL_MAX, so there can never be a
-                    # ninth connection to return), but the branch stays: it is
-                    # load-bearing if those two ever drift apart, and a leak is
-                    # the failure mode it prevents.
+                if broken:
                     self._close_read_conn(conn)
+                else:
+                    returned = False
+                    with self._read_conns_lock:
+                        if not self._read_conns_closed:
+                            try:
+                                self._read_pool.put_nowait(conn)
+                                returned = True
+                            except queue.Full:
+                                pass
+                    if not returned:
+                        # close() has already drained the pool, so this connection
+                        # is surplus. Close it here — dropping it on the floor is
+                        # what leaked the fd.
+                        #
+                        # queue.Full is now unreachable in practice (permits and
+                        # maxsize are both _READ_POOL_MAX, so there can never be a
+                        # ninth connection to return), but the branch stays: it is
+                        # load-bearing if those two ever drift apart, and a leak is
+                        # the failure mode it prevents.
+                        self._close_read_conn(conn)
             return
         with self._lock:
             yield self._conn
@@ -5738,11 +5756,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not session_id:
             return None
         now = time.time()
-        row = self._conn.execute(
-            "SELECT holder FROM compression_locks "
-            "WHERE session_id = ? AND expires_at >= ?",
-            (session_id, now),
-        ).fetchone()
+        # local fix 2026.8.16: read via _read_ctx (degrades to self._lock
+        # when WAL is inactive) — a bare self._conn read joins any in-flight
+        # BEGIN IMMEDIATE transaction and can see rows that roll back
+        # (upstream #86516)
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT holder FROM compression_locks "
+                "WHERE session_id = ? AND expires_at >= ?",
+                (session_id, now),
+            ).fetchone()
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
@@ -5816,11 +5839,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # No-op fast path: skip the transaction when there is nothing to
         # clear. Read-only, no write lock.
         try:
-            row = self._conn.execute(
-                "SELECT last_activity_description, last_activity_provenance "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
+            # local fix 2026.8.16: read via _read_ctx (degrades to self._lock
+            # when WAL is inactive) — a bare self._conn read joins any
+            # in-flight BEGIN IMMEDIATE transaction and can see rows that
+            # roll back (upstream #86516)
+            with self._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT last_activity_description, last_activity_provenance "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
         except sqlite3.Error:
             row = None
         if row is not None:
@@ -10728,7 +10756,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                automatically clears bindings.
         """
         def _do(conn):
-            conn.executescript(
+            # local fix 2026.8.16: run each DDL statement individually —
+            # executescript issues an implicit COMMIT that would break the
+            # surrounding BEGIN IMMEDIATE transaction (same rule as the CJK
+            # recreate path in hermes_state_search.py) (upstream #86483)
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS telegram_dm_topic_mode (
                     chat_id TEXT PRIMARY KEY,
@@ -10741,8 +10773,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     capability_checked_at REAL,
                     intro_message_id TEXT,
                     pinned_message_id TEXT
-                );
-
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS telegram_dm_topic_bindings (
                     chat_id TEXT NOT NULL,
                     thread_id TEXT NOT NULL,
@@ -10753,13 +10788,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     linked_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (chat_id, thread_id)
-                );
-
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_session
-                ON telegram_dm_topic_bindings(session_id);
-
+                ON telegram_dm_topic_bindings(session_id)
+                """
+            )
+            conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_user
-                ON telegram_dm_topic_bindings(user_id, chat_id);
+                ON telegram_dm_topic_bindings(user_id, chat_id)
                 """
             )
 
@@ -10780,7 +10821,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     for row in fk_rows
                 )
                 if needs_rebuild:
-                    conn.executescript(
+                    # local fix 2026.8.16: run each rebuild statement
+                    # individually — executescript issues an implicit COMMIT
+                    # that would break the surrounding BEGIN IMMEDIATE
+                    # transaction, and a partial autocommit rebuild
+                    # (DROP before RENAME) strands all bindings on retry
+                    # (upstream #86483)
+                    conn.execute(
                         """
                         CREATE TABLE telegram_dm_topic_bindings_new (
                             chat_id TEXT NOT NULL,
@@ -10792,18 +10839,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             linked_at REAL NOT NULL,
                             updated_at REAL NOT NULL,
                             PRIMARY KEY (chat_id, thread_id)
-                        );
+                        )
+                        """
+                    )
+                    conn.execute(
+                        """
                         INSERT INTO telegram_dm_topic_bindings_new
                             SELECT chat_id, thread_id, user_id, session_key,
                                    session_id, managed_mode, linked_at, updated_at
-                            FROM telegram_dm_topic_bindings;
-                        DROP TABLE telegram_dm_topic_bindings;
+                            FROM telegram_dm_topic_bindings
+                        """
+                    )
+                    conn.execute("DROP TABLE telegram_dm_topic_bindings")
+                    conn.execute(
+                        """
                         ALTER TABLE telegram_dm_topic_bindings_new
-                            RENAME TO telegram_dm_topic_bindings;
+                        RENAME TO telegram_dm_topic_bindings
+                        """
+                    )
+                    conn.execute(
+                        """
                         CREATE UNIQUE INDEX idx_telegram_dm_topic_bindings_session
-                            ON telegram_dm_topic_bindings(session_id);
+                        ON telegram_dm_topic_bindings(session_id)
+                        """
+                    )
+                    conn.execute(
+                        """
                         CREATE INDEX idx_telegram_dm_topic_bindings_user
-                            ON telegram_dm_topic_bindings(user_id, chat_id);
+                        ON telegram_dm_topic_bindings(user_id, chat_id)
                         """
                     )
 
@@ -11489,12 +11552,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         no handoff record.
         """
         try:
-            cur = self._conn.execute(
-                "SELECT handoff_state, handoff_platform, handoff_error "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            )
-            row = cur.fetchone()
+            # local fix 2026.8.16: read via _read_ctx (degrades to self._lock
+            # when WAL is inactive) — a bare self._conn read joins any
+            # in-flight BEGIN IMMEDIATE transaction and can see rows that
+            # roll back (upstream #86516)
+            with self._read_ctx() as conn:
+                cur = conn.execute(
+                    "SELECT handoff_state, handoff_platform, handoff_error "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+                row = cur.fetchone()
             if not row:
                 return None
             return {
@@ -11511,15 +11579,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Used by the gateway's handoff watcher.
         """
         try:
-            cur = self._conn.execute(
-                "SELECT s.*, "
-                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
-                "FROM sessions s "
-                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.handoff_state = 'pending' "
-                "ORDER BY s.started_at ASC"
-            )
-            return [self._session_row_dict(r) for r in cur.fetchall()]
+            # local fix 2026.8.16: read via _read_ctx (degrades to self._lock
+            # when WAL is inactive) — a bare self._conn read joins any
+            # in-flight BEGIN IMMEDIATE transaction and can see rows that
+            # roll back (upstream #86516)
+            with self._read_ctx() as conn:
+                cur = conn.execute(
+                    "SELECT s.*, "
+                    "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
+                    "FROM sessions s "
+                    "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+                    "WHERE s.handoff_state = 'pending' "
+                    "ORDER BY s.started_at ASC"
+                )
+                return [self._session_row_dict(r) for r in cur.fetchall()]
         except Exception:
             return []
 

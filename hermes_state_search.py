@@ -699,12 +699,19 @@ class SessionSearchMixin:
             ).fetchone())
             if had:
                 conn.execute("PRAGMA writable_schema=ON")
-                conn.execute(
-                    "DELETE FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('messages_fts', 'messages_fts_trigram') "
-                    "AND sql LIKE 'CREATE VIRTUAL TABLE%'"
-                )
-                conn.execute("PRAGMA writable_schema=RESET")
+                try:
+                    conn.execute(
+                        "DELETE FROM sqlite_master WHERE type = 'table' "
+                        "AND name IN ('messages_fts', 'messages_fts_trigram') "
+                        "AND sql LIKE 'CREATE VIRTUAL TABLE%'"
+                    )
+                finally:
+                    # local fix 2026.8.16: writable_schema is a connection-level
+                    # switch that does not roll back with the transaction — RESET
+                    # must run even when the DELETE raises, or the long-lived
+                    # write connection stays degraded until process exit
+                    # (upstream #86517)
+                    conn.execute("PRAGMA writable_schema=RESET")
                 shadows = [
                     r[0] for r in conn.execute(
                         "SELECT name FROM sqlite_master WHERE type = 'table' "
