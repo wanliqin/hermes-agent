@@ -24,10 +24,13 @@ move-and-name refactor with no semantic change.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
 import uuid
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -48,6 +51,70 @@ from agent.model_metadata import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _build_curator_suggestions_block() -> Optional[str]:
+    """Surface queued background-curator skill proposals for user review.
+
+    The autonomous background review fork may attempt skill_manage writes
+    that the provenance guard refuses (external/user-owned skills). Those
+    proposals are queued to ``curator-suggestions.jsonl`` by
+    ``tools.skill_manager_tool``. Inject the unsurfaced ones into the next
+    foreground turn so a user-present agent can judge and (optionally)
+    apply them — foreground edits to external skills are permitted.
+    Skipped for background-review turns (the fork must not consume its own
+    queue) and injected only once per suggestion (marked surfaced).
+    """
+    try:
+        from tools.skill_provenance import is_background_review
+        if is_background_review():
+            return None
+    except Exception:
+        pass
+    try:
+        home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+        q = Path(home) / "curator-suggestions.jsonl"
+        if not q.exists():
+            return None
+        recs = []
+        for ln in q.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                recs.append(json.loads(ln))
+            except Exception:
+                continue
+        pending = [r for r in recs if not r.get("surfaced")]
+        if not pending:
+            return None
+        show = pending[-5:]
+        for r in show:
+            r["surfaced"] = True
+        q.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in recs) + "\n",
+            encoding="utf-8",
+        )
+        items = []
+        for r in show:
+            payload = r.get("payload") or {}
+            detail = "; ".join(f"{k}={str(v)[:160]}" for k, v in payload.items())
+            line = f"- [{r.get('action')}] 技能 '{r.get('skill')}' @ {r.get('ts')}"
+            if detail:
+                line += f" — {detail}"
+            items.append(line)
+        return (
+            "[后台技能策展建议 — 待用户裁决]\n"
+            "后台 curator 自动维护时尝试修改以下技能，被安全策略拦截（无人值守、"
+            "无权直接改外部/用户技能）。请向用户说明并评估：采纳则用 skill_manage "
+            "前台执行（前台允许），不采纳可忽略；不要擅自执行。完整队列："
+            f"{q}（共 {len(recs)} 条，本提示仅在新建议出现时注入一次）\n"
+            + "\n".join(items)
+        )
+    except Exception:
+        logger.debug("curator suggestions block failed", exc_info=True)
+        return None
+
 
 
 def compose_user_api_content(
@@ -80,6 +147,9 @@ def compose_user_api_content(
             injections.append(fenced)
     if plugin_user_context:
         injections.append(plugin_user_context)
+    _curator_block = _build_curator_suggestions_block()
+    if _curator_block:
+        injections.append(_curator_block)
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)

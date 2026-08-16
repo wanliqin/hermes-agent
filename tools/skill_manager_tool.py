@@ -32,10 +32,13 @@ Directory layout for user skills:
             └── SKILL.md
 """
 
+import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+from datetime import datetime, timezone
 import contextvars as _ctxvars
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -419,6 +422,64 @@ def _background_review_write_guard(
             ),
         }
     return None
+
+
+def _record_curator_suggestion(name: str, action: str, payload: Dict[str, Any]) -> None:
+    """Queue a refused background-curator proposal for later user review.
+
+    The background review fork is autonomous and unpersisted: when the write
+    guard refuses its skill_manage call, the intent would otherwise die
+    inside the fork. Queue it (deduped by content hash) so the next
+    foreground turn can surface it via
+    ``agent.turn_context._build_curator_suggestions_block`` and a
+    user-present agent can judge/apply it.
+    """
+    try:
+        home = str(get_hermes_home())
+        q = Path(home) / "curator-suggestions.jsonl"
+        norm = {
+            k: (v[:2000] if isinstance(v, str) else v)
+            for k, v in (payload or {}).items()
+        }
+        h = hashlib.sha256(
+            f"{action}|{name}|{json.dumps(norm, ensure_ascii=False, sort_keys=True)}".encode()
+        ).hexdigest()[:16]
+        if q.exists() and f'"hash": "{h}"' in q.read_text(encoding="utf-8"):
+            return
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "hash": h,
+            "action": action,
+            "skill": name,
+            "payload": norm,
+            "surfaced": False,
+        }
+        with q.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # rotate: keep the newest 200 lines once past 500
+        try:
+            lines = q.read_text(encoding="utf-8").splitlines()
+            if len(lines) > 500:
+                q.write_text("\n".join(lines[-200:]) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+    except Exception:
+        logger.debug("curator suggestion record failed", exc_info=True)
+
+
+def _refuse_with_suggestion(guard: Dict[str, Any], name: str, action: str,
+                            payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Queue the refused proposal and tell the fork to stop retrying it."""
+    _record_curator_suggestion(name, action, payload)
+    try:
+        guard = dict(guard)
+        guard["error"] = str(guard.get("error", "")) + (
+            " This proposal has been queued to curator-suggestions.jsonl for "
+            "user review - do NOT retry it in this fork."
+        )
+    except Exception:
+        pass
+    return guard
 
 
 def _background_review_read_before_write_guard(
@@ -1021,7 +1082,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         return org_guard
     guard = _background_review_write_guard(name, existing["path"], "edit")
     if guard:
-        return guard
+        return _refuse_with_suggestion(guard, name, "edit", {"content": content})
 
     skill_md = existing["path"] / "SKILL.md"
     read_guard = _background_review_read_before_write_guard(
@@ -1092,7 +1153,7 @@ def _patch_skill(
         return org_guard
     guard = _background_review_write_guard(name, skill_dir, "patch")
     if guard:
-        return guard
+        return _refuse_with_suggestion(guard, name, "patch", {"file_path": file_path, "old_string": old_string, "new_string": new_string})
 
     if file_path:
         # Patching a supporting file
@@ -1205,7 +1266,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
         return org_guard
     guard = _background_review_write_guard(name, existing["path"], "delete")
     if guard:
-        return guard
+        return _refuse_with_suggestion(guard, name, "delete", {})
 
     # Fail closed on unverified deletes during the curator consolidation pass.
     # A bare prune (no absorbed_into) from the LLM umbrella pass is the
@@ -1325,7 +1386,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         return org_guard
     guard = _background_review_write_guard(name, existing["path"], "write_file")
     if guard:
-        return guard
+        return _refuse_with_suggestion(guard, name, "write_file", {"file_path": file_path, "content": file_content})
 
     target, err = _resolve_skill_target(existing["path"], file_path)
     if err:
@@ -1376,7 +1437,7 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     skill_dir = existing["path"]
     guard = _background_review_write_guard(name, skill_dir, "remove_file")
     if guard:
-        return guard
+        return _refuse_with_suggestion(guard, name, "remove_file", {"file_path": file_path})
 
     target, err = _resolve_skill_target(skill_dir, file_path)
     if err:
