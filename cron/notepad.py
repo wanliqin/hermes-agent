@@ -32,15 +32,35 @@ from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
 NOTEPAD_FILE = get_hermes_home().resolve() / "cron" / "notepad.db"
+# local fix 2026.8.16: import-time snapshot so a deliberate monkeypatch of
+# NOTEPAD_FILE stays distinguishable from a stale frozen path (upstream #86519)
+_IMPORT_NOTEPAD_FILE = NOTEPAD_FILE
 MAX_VALUE_BYTES = 16 * 1024
 MAX_KEY_CHARS = 128
 MAX_JOB_TOTAL_BYTES = 64 * 1024
 _lock = threading.RLock()
 
 
+def _current_notepad_file():
+    """Resolve the notepad path per call, not once at import.
+
+    local fix 2026.8.16: under multiplex each profile tick re-points the cron
+    store via use_cron_store()/set_hermes_home_override; a path frozen at
+    import makes remove_job()/clear_notepad() wipe the wrong profile's DB and
+    orphan the real rows (upstream #86519). Follows the _current_cron_store()
+    pattern from cron/jobs.py; a re-pointed NOTEPAD_FILE (documented test
+    escape hatch) is honored as-is.
+    """
+    if NOTEPAD_FILE != _IMPORT_NOTEPAD_FILE:
+        return NOTEPAD_FILE
+    from cron.jobs import _current_cron_store
+    return _current_cron_store().cron_dir / "notepad.db"
+
+
 def _connect() -> sqlite3.Connection:
-    NOTEPAD_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(NOTEPAD_FILE, timeout=5)
+    path = _current_notepad_file()  # local fix 2026.8.16 (upstream #86519)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(path, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -155,7 +175,7 @@ def clear_notepad(job_id: str) -> int:
     Called from ``cron.jobs.remove_job`` so deleted jobs don't orphan their
     rows. No-ops without creating the DB when no notepad file exists yet.
     """
-    if not NOTEPAD_FILE.exists():
+    if not _current_notepad_file().exists():  # local fix 2026.8.16 (upstream #86519)
         return 0
     with _transaction() as conn:
         cur = conn.execute(

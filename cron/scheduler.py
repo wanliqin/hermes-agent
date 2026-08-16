@@ -5285,6 +5285,27 @@ def tick(
             membership is released in the worker's finally block.
             """
             job_id = job["id"]
+
+            def _clear_oneshot_run_claim() -> None:
+                # local fix 2026.8.16: a skipped/failed one-shot dispatch must
+                # not keep its run_claim until the TTL expires — clear it so
+                # the next healthy tick picks the job up immediately
+                # (upstream #86522). Best-effort: never break the skip path.
+                if job.get("schedule", {}).get("kind") != "once":
+                    return
+                try:
+                    from cron.jobs import clear_run_claim
+                    clear_run_claim(
+                        job_id,
+                        expected_owner=(job.get("run_claim") or {}).get("by"),
+                    )
+                except Exception:
+                    logger.debug(
+                        "Job '%s': failed to clear one-shot run_claim",
+                        job.get("name", job_id),
+                        exc_info=True,
+                    )
+
             # A tick can race gateway teardown: once the interpreter is
             # finalizing, ``pool.submit`` raises "cannot schedule new futures
             # after interpreter shutdown" and crashes the tick. Skip cleanly —
@@ -5295,13 +5316,23 @@ def tick(
                     "Job '%s' not dispatched — interpreter is shutting down",
                     job.get("name", job_id),
                 )
+                _clear_oneshot_run_claim()  # local fix 2026.8.16 (upstream #86522)
                 return None
             if not try_register_running_job(job_id):
                 logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                 return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            # local fix 2026.8.15: release the running-slot if the ledger write fails,
+            # otherwise the job is stuck "already running" until restart (upstream #86482)
+            try:
+                execution = create_execution(job_id, source="builtin")
+            except Exception as exc:
+                release_running_job(job_id)
+                logger.error("Job '%s': execution ledger write failed, skipping this fire: %s",
+                             job.get("name", job_id), exc)
+                _clear_oneshot_run_claim()  # local fix 2026.8.16 (upstream #86522)
+                return None
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 
@@ -5320,6 +5351,7 @@ def tick(
                     success=False,
                     error=f"Executor dispatch failed: {submit_err}",
                 )
+                _clear_oneshot_run_claim()  # local fix 2026.8.16 (upstream #86522)
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
                 if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):

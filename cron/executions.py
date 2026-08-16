@@ -12,21 +12,48 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import timezone
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+# local fix 2026.8.16: import-time snapshot so a deliberate monkeypatch of
+# EXECUTIONS_FILE stays distinguishable from a stale frozen path (upstream #86519)
+_IMPORT_EXECUTIONS_FILE = EXECUTIONS_FILE
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
+def _current_executions_file():
+    """Resolve the ledger path per call, not once at import.
+
+    local fix 2026.8.16: under multiplex each profile tick re-points the cron
+    store via use_cron_store()/set_hermes_home_override; a path frozen at
+    import writes every profile's records into the default profile's DB
+    (upstream #86519). Follows the _current_cron_store() pattern from
+    cron/jobs.py; a re-pointed EXECUTIONS_FILE (documented test escape hatch)
+    is honored as-is.
+    """
+    if EXECUTIONS_FILE != _IMPORT_EXECUTIONS_FILE:
+        return EXECUTIONS_FILE
+    from cron.jobs import _current_cron_store
+    return _current_cron_store().cron_dir / "executions.db"
+
+
+def _utc_now_iso() -> str:
+    # local fix 2026.8.16: store timestamps in UTC so lexicographic TEXT
+    # ordering matches absolute time across DST/timezone changes (upstream #86520)
+    return _hermes_now().astimezone(timezone.utc).isoformat()
+
+
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    path = _current_executions_file()  # local fix 2026.8.16 (upstream #86519)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(path, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -134,7 +161,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
 
 def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch."""
-    now = _hermes_now().isoformat()
+    now = _utc_now_iso()  # local fix 2026.8.16: UTC so lexicographic sort == absolute time (upstream #86520)
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
     with _transaction() as conn:
@@ -156,7 +183,7 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
 
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
-    now = _hermes_now().isoformat()
+    now = _utc_now_iso()  # local fix 2026.8.16: UTC so lexicographic sort == absolute time (upstream #86520)
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions SET status='running', started_at=?
@@ -177,7 +204,7 @@ def finish_execution(
     delivery_outcome: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
-    now = _hermes_now().isoformat()
+    now = _utc_now_iso()  # local fix 2026.8.16: UTC so lexicographic sort == absolute time (upstream #86520)
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
@@ -198,7 +225,7 @@ def finish_execution(
 
 def recover_interrupted_executions() -> int:
     """Mark provably abandoned attempts unknown without scheduling retries."""
-    now = _hermes_now().isoformat()
+    now = _utc_now_iso()  # local fix 2026.8.16: UTC so lexicographic sort == absolute time (upstream #86520)
     changed = 0
     recovered: List[Dict[str, Any]] = []
     with _transaction() as conn:
