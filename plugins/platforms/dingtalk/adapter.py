@@ -1347,9 +1347,20 @@ class DingTalkAdapter(BasePlatformAdapter):
         """
         if not message_id:
             return SendResult(success=False, error="message_id required")
+        if not self._card_sdk:
+            # Card SDK is only initialized when a card_template_id is
+            # configured; stream edits on adapters without cards must not
+            # crash (regression guard for dingtalk-stream >= 0.24).
+            return SendResult(
+                success=False,
+                error="card SDK not initialized (card_template_id not configured)",
+            )
         token = await self._get_access_token()
         if not token:
             return SendResult(success=False, error="No access token")
+
+        if self._card_sdk is None:
+            return SendResult(success=False, error="card SDK not initialized")
 
         try:
             await self._stream_card_content(
