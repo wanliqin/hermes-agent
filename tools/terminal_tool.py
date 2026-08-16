@@ -3271,7 +3271,9 @@ def terminal_tool(
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
-                    if "timeout" in error_str:
+                    # local fix 2026.8.15: TimeoutError str() is "" and TimeoutExpired says "timed out",
+                    # so a text-only "timeout" check never fires and timeouts were retried (upstream #86481)
+                    if isinstance(e, (TimeoutError, subprocess.TimeoutExpired)) or "timed out" in error_str or "timeout" in error_str:
                         return json.dumps({
                             "output": "",
                             "exit_code": 124,

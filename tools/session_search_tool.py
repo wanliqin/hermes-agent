@@ -895,6 +895,7 @@ def session_search(
     # Cross-profile read: swap in the named profile's DB (read-only) for every
     # shape below. The current-session-lineage guards no longer apply across
     # profiles, but they key off ids that won't collide, so they stay inert.
+    profile_db = None
     if profile is not None and str(profile).strip():
         try:
             profile_db = _resolve_profile_db(profile)
@@ -904,70 +905,77 @@ def session_search(
             db = profile_db
             current_session_id = None
 
-    # Scroll shape takes precedence — explicit anchor beats any query.
-    if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
-        return _scroll(
-            db=db,
-            session_id=session_id,
-            around_message_id=around_message_id,
-            window=window,
-            current_session_id=current_session_id,
-        )
+    # local fix 2026.8.16: a cross-profile SessionDB is a tracked SQLite
+    # connection — close it on every exit path or the profile's tracked
+    # connection count leaks permanently (upstream #86512)
+    try:
+        # Scroll shape takes precedence — explicit anchor beats any query.
+        if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
+            return _scroll(
+                db=db,
+                session_id=session_id,
+                around_message_id=around_message_id,
+                window=window,
+                current_session_id=current_session_id,
+            )
 
-    # Read shape: a session_id with no anchor → dump the whole session.
-    if isinstance(session_id, str) and session_id.strip():
-        sid = session_id.strip()
-        result = _read_session(db, sid, link_profile=profile)
-        if json.loads(result).get("success"):
+        # Read shape: a session_id with no anchor → dump the whole session.
+        if isinstance(session_id, str) and session_id.strip():
+            sid = session_id.strip()
+            result = _read_session(db, sid, link_profile=profile)
+            if json.loads(result).get("success"):
+                return result
+
+            # Miss in the target profile — the model may have dropped the owning
+            # profile from the link. Scan every profile and read it from wherever
+            # it lives, tagging the profile it was found in.
+            located, owner = _locate_session_db(sid)
+            if located is not None:
+                try:
+                    found = json.loads(_read_session(located, sid, link_profile=owner))
+                finally:
+                    located.close()
+                if found.get("success"):
+                    found["profile"] = owner
+                    return json.dumps(found, ensure_ascii=False)
             return result
 
-        # Miss in the target profile — the model may have dropped the owning
-        # profile from the link. Scan every profile and read it from wherever
-        # it lives, tagging the profile it was found in.
-        located, owner = _locate_session_db(sid)
-        if located is not None:
+        # Limit clamp [1, 10]
+        if not isinstance(limit, int):
             try:
-                found = json.loads(_read_session(located, sid, link_profile=owner))
-            finally:
-                located.close()
-            if found.get("success"):
-                found["profile"] = owner
-                return json.dumps(found, ensure_ascii=False)
-        return result
+                limit = int(limit)
+            except (TypeError, ValueError):
+                limit = 3
+        limit = max(1, min(limit, 10))
 
-    # Limit clamp [1, 10]
-    if not isinstance(limit, int):
-        try:
-            limit = int(limit)
-        except (TypeError, ValueError):
-            limit = 3
-    limit = max(1, min(limit, 10))
+        # Browse shape: no query → recent sessions.
+        if not query or not isinstance(query, str) or not query.strip():
+            return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
 
-    # Browse shape: no query → recent sessions.
-    if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
+        # Parse role_filter
+        role_list: Optional[List[str]] = None
+        if isinstance(role_filter, str) and role_filter.strip():
+            role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
 
-    # Parse role_filter
-    role_list: Optional[List[str]] = None
-    if isinstance(role_filter, str) and role_filter.strip():
-        role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
+        # Normalise sort
+        sort_norm: Optional[str] = None
+        if isinstance(sort, str):
+            candidate = sort.strip().lower()
+            if candidate in ("newest", "oldest"):
+                sort_norm = candidate
 
-    # Normalise sort
-    sort_norm: Optional[str] = None
-    if isinstance(sort, str):
-        candidate = sort.strip().lower()
-        if candidate in ("newest", "oldest"):
-            sort_norm = candidate
-
-    return _discover(
-        db=db,
-        query=query.strip(),
-        role_filter=role_list,
-        limit=limit,
-        sort=sort_norm,
-        current_session_id=current_session_id,
-        link_profile=profile,
-    )
+        return _discover(
+            db=db,
+            query=query.strip(),
+            role_filter=role_list,
+            limit=limit,
+            sort=sort_norm,
+            current_session_id=current_session_id,
+            link_profile=profile,
+        )
+    finally:
+        if profile_db is not None:
+            profile_db.close()
 
 
 def check_session_search_requirements() -> bool:

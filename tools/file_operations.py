@@ -1484,6 +1484,17 @@ class ShellFileOperations(FileOperations):
             total_lines = int(wc_output.strip())
         except ValueError:
             total_lines = 0
+
+        # local fix 2026.8.16: wc -l counts newline characters, so a final
+        # unterminated line is invisible; probe the last byte and count it
+        # (upstream #86510). The probe result is also reused below to strip
+        # the phantom empty line ``cut`` adds for such files.
+        tail_cmd = f"tail -c 1 {self._escape_shell_arg(path)} | wc -l"
+        tail_result = self._exec(tail_cmd)
+        tail_output = _strip_terminal_fence_leaks(tail_result.stdout)
+        no_trailing_newline = tail_result.exit_code == 0 and tail_output.strip() == "0"
+        if no_trailing_newline and total_lines > 0:
+            total_lines += 1
         
         # Check if truncated
         truncated = total_lines > end_line
@@ -1495,12 +1506,8 @@ class ShellFileOperations(FileOperations):
         # so a file whose final line has no trailing newline would grow a
         # phantom empty last line. Only possible when this page reaches the
         # file's final line; probe the last byte and strip the artifact.
-        if not truncated and read_output.endswith('\n'):
-            tail_cmd = f"tail -c 1 {self._escape_shell_arg(path)} | wc -l"
-            tail_result = self._exec(tail_cmd)
-            tail_output = _strip_terminal_fence_leaks(tail_result.stdout)
-            if tail_result.exit_code == 0 and tail_output.strip() == "0":
-                read_output = read_output[:-1]
+        if not truncated and read_output.endswith('\n') and no_trailing_newline:
+            read_output = read_output[:-1]
 
         # Ambiguous-silence guards: an empty content string is
         # indistinguishable, from inside the model, from a broken tool —
@@ -3037,7 +3044,7 @@ class ShellFileOperations(FileOperations):
             return SearchResult(
                 files=page,
                 total_count=total,
-                truncated=bool(limit_reason),
+                truncated=total >= offset + limit or bool(limit_reason),  # local fix 2026.8.16: same head-cap fix as content branch — ">" never fires (upstream #86480)
                 limit_reason=limit_reason,
                 warning=_ml_note,
             )
@@ -3098,7 +3105,7 @@ class ShellFileOperations(FileOperations):
             return SearchResult(
                 matches=page,
                 total_count=total,
-                truncated=total > offset + limit or bool(limit_reason),
+                truncated=total >= offset + limit or bool(limit_reason),  # local fix 2026.8.15: head caps total at limit+offset so ">" never fires (upstream #86480)
                 limit_reason=limit_reason,
                 warning=_ml_note,
             )
@@ -3179,7 +3186,7 @@ class ShellFileOperations(FileOperations):
             return SearchResult(
                 files=page,
                 total_count=total,
-                truncated=bool(limit_reason),
+                truncated=total >= offset + limit or bool(limit_reason),  # local fix 2026.8.16: same head-cap fix as content branch — ">" never fires (upstream #86480)
                 limit_reason=limit_reason,
             )
         
@@ -3236,6 +3243,6 @@ class ShellFileOperations(FileOperations):
             return SearchResult(
                 matches=page,
                 total_count=total,
-                truncated=total > offset + limit or bool(limit_reason),
+                truncated=total >= offset + limit or bool(limit_reason),  # local fix 2026.8.15: head caps total at limit+offset so ">" never fires (upstream #86480)
                 limit_reason=limit_reason,
             )
