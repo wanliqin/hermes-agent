@@ -12251,6 +12251,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
+        # Background idle compaction: sessions idle past the threshold get
+        # compressed in the background (not on the next user message), with
+        # proactive notices to the session (start / in-progress / done / fail).
+        self._spawn_supervised(
+            self._background_compaction_loop, "background_compaction_loop"
+        )
+
         # Stall watchdog: pending inbound + stale agent activity → warn user
         # to /new (does not kill the turn; see agent.session_stall_timeout).
         self._spawn_supervised(self._session_stall_watcher, "session_stall_watcher")
@@ -12709,6 +12716,479 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(result, "success", True):
             err = getattr(result, "error", "send returned success=False")
             raise RuntimeError(f"adapter.send failed: {err}")
+
+    # ── 后台空闲压缩（background idle compaction）────────────────────
+    # 会话闲置超过 idle_seconds 且上下文超过压缩阈值时，在后台自动压缩，
+    # 不等用户下一条消息；压缩全程向会话主动提示（开始/进行/完成/失败）。
+    # 复用 agent._compress_context（fence/锁/cooldown 由它保证并发安全），
+    # 与 hygiene 压缩（下一条消息前触发）互补，互不冲突。
+    def _background_compaction_config(self) -> dict:
+        """Read ``compression.background_compaction`` config (fail-closed)."""
+        try:
+            _cfg = _load_gateway_config().get("compression", {}) or {}
+            _bc = _cfg.get("background_compaction", {}) or {}
+            _enabled = str(_bc.get("enabled", False)).lower() in {"true", "1", "yes"}
+            return {
+                "enabled": _enabled,
+                "idle_seconds": float(_bc.get("idle_seconds", 300)),
+                "interval_seconds": int(_bc.get("interval_seconds", 60)),
+                "token_threshold": int(_bc.get("token_threshold", 0) or 0),
+            }
+        except Exception:
+            return {"enabled": False, "idle_seconds": 300.0, "interval_seconds": 60, "token_threshold": 0}
+
+    async def _background_compaction_loop(self, interval: int = 60) -> None:
+        """后台自动压缩闲置会话的上下文（不等用户下一条消息）。
+
+        - 会话闲置 >= idle_seconds 且上下文超过压缩阈值 → 后台压缩
+        - 压缩全程向会话主动提示（开始/进行中/完成/失败），用户可感知
+        - 复用 agent._compress_context（fence/锁/cooldown 由其保证）
+        """
+        await asyncio.sleep(30)  # 启动延迟 — 让 gateway 完全就绪
+        while self._running:
+            try:
+                _cfg = self._background_compaction_config()
+                interval = max(int(_cfg.get("interval_seconds", 60) or 60), 10)
+                await self._run_background_compaction_pass()
+            except Exception:
+                logger.debug("Background compaction pass failed", exc_info=True)
+            await asyncio.sleep(interval)
+
+    async def _run_background_compaction_pass(self) -> None:
+        """扫描所有会话，选出「闲置 + 超阈值 + 无冷却」的会话后台压缩。"""
+        _cfg = self._background_compaction_config()
+        if not _cfg["enabled"]:
+            return
+        _idle_min = _cfg["idle_seconds"]
+        try:
+            _cfg_data = _load_gateway_config().get("compression", {}) or {}
+            _token_threshold = _cfg.get("token_threshold", 0)
+            _threshold_pct = float(_cfg_data.get("threshold", 0.5))
+            _ctx_len = int(_cfg_data.get("context_length", 0) or 0)
+            if _ctx_len <= 0:
+                _ctx_len = 1000000
+            # token_threshold 为绝对触发阈值；未配置时回退 context_length × threshold
+            _threshold_tokens = _token_threshold if _token_threshold > 0 else int(_ctx_len * _threshold_pct)
+        except Exception:
+            return
+        _now = datetime.now()
+        _sessions = getattr(self.session_store, "_entries", {}) or {}
+        for key, entry in list(_sessions.items()):
+            try:
+                if getattr(entry, "expiry_finalized", False):
+                    continue
+                _origin = getattr(entry, "origin", None)
+                if not _origin or not getattr(_origin, "platform", None) \
+                        or not getattr(_origin, "chat_id", None):
+                    continue
+                if getattr(entry, "last_prompt_tokens", 0) <= 0:
+                    continue
+                if entry.last_prompt_tokens < _threshold_tokens:
+                    continue
+                try:
+                    _idle = (_now - entry.updated_at).total_seconds()
+                except Exception:
+                    continue
+                if _idle < _idle_min:
+                    continue
+                # 持久化压缩冷却检查（失败后不重试，由 hygiene 兜底）
+                _session_db = getattr(self, "_session_db", None)
+                _db = getattr(_session_db, "_db", _session_db)
+                _getter = getattr(_db, "get_compression_failure_cooldown", None)
+                if _getter is not None:
+                    try:
+                        _cs = _getter(entry.session_id)
+                        if _cs and _cs.get("remaining_seconds", 0) > 0:
+                            continue
+                    except Exception:
+                        pass
+                # turn 进行中不压：原地重写 SessionDB 会与 turn 收尾的
+                # flush 竞态（防失忆守卫还可能用内存旧历史回滚压缩）
+                if self._is_session_running(key):
+                    continue
+                logger.info(
+                    "Background compaction: session %s idle %.0fs, ~%s tokens >= %s — compacting",
+                    key, _idle, f"{entry.last_prompt_tokens:,}",
+                    f"{_threshold_tokens:,}",
+                )
+                asyncio.create_task(
+                    self._background_compact_session(key, entry, _cfg)
+                )
+            except Exception:
+                logger.debug(
+                    "Background compaction candidate check failed for %s",
+                    key, exc_info=True,
+                )
+
+    async def _background_compact_session(
+        self, key: str, entry: Any, cfg: dict
+    ) -> None:
+        """单个会话的后台压缩 + 主动提示（开始/完成/失败）。
+
+        与 session hygiene 同一套原语（一次性 AIAgent + commit fence +
+        持久化失败冷却），不碰缓存的活 agent：
+        - 活 agent 可能挂着未消费的 pending context-engine notification，
+          compress_context 开头直接抛 RuntimeError 且无冷却记录 —— 实测
+          造成每分钟重试 + 通知轰炸（5 次/4 分钟）；
+        - 成功后 update_session(last_prompt_tokens=0, touch_activity=False)
+          回写计数，60s 扫描不会拿陈旧 token 数重复触发（下一条真实消息
+          会重新基线化该值；touch_activity=False 保持空闲计时）；
+        - 成功后 _evict_cached_agent 驱逐缓存 agent，下一条消息从压缩后的
+          DB 重建 —— 否则防失忆守卫优先选内存里的旧长历史，压缩被整体
+          回滚；
+        - abort/no-op/超时/异常全部落持久化冷却（与 hygiene 同一列同一
+          阶梯），冷却期内扫描跳过，不会通知轰炸。
+        """
+        _bg_agent = None
+        _cleanup_deferred = False
+        # 与 hygiene 相同的超时/冷却配置（同一批 compression.* 键）
+        try:
+            _comp_cfg = _load_gateway_config().get("compression", {}) or {}
+        except Exception:
+            _comp_cfg = {}
+        try:
+            _idle_budget = float(_comp_cfg.get("hygiene_timeout_seconds", 30.0) or 30.0)
+        except (TypeError, ValueError):
+            _idle_budget = 30.0
+        try:
+            _total_ceiling = float(
+                _comp_cfg.get("hygiene_total_ceiling_seconds", 600.0) or 600.0
+            )
+        except (TypeError, ValueError):
+            _total_ceiling = 600.0
+        _total_ceiling = max(_total_ceiling, _idle_budget)
+        try:
+            _failure_cooldown_seconds = float(
+                _comp_cfg.get("hygiene_failure_cooldown_seconds", 300.0)
+            )
+        except (TypeError, ValueError):
+            _failure_cooldown_seconds = 300.0
+
+        try:
+            from agent.conversation_compression import CompressionCommitFence
+            from agent.model_metadata import estimate_messages_tokens_rough
+            from run_agent import AIAgent
+
+            # 完整 transcript（含 tool 结果）—— 与 hygiene/#3854 一致
+            try:
+                _history = await self.async_session_store.load_transcript(
+                    entry.session_id
+                )
+            except Exception:
+                _history = []
+            _msgs = [
+                m for m in (_history or [])
+                if m.get("role") in {"user", "assistant", "tool"}
+            ]
+            # 空历史 / 历史装得进 tail 预算 → 本来就无可压：静默把计数
+            # 回写为历史估算值（触发条件自然失效），不通知、不记冷却。
+            # last_prompt_tokens 里 system+tools 占大头，可压的只有历史；
+            # 下一条真实消息会把计数重新基线化。
+            _hist_est = estimate_messages_tokens_rough(_msgs)
+            _bg_tok_thr0 = int(cfg.get("token_threshold", 0) or 0)
+            if len(_msgs) < 4 or (
+                _bg_tok_thr0 > 0 and _hist_est <= int(_bg_tok_thr0 * 0.5)
+            ):
+                await self.async_session_store.update_session(
+                    key, last_prompt_tokens=_hist_est, touch_activity=False,
+                )
+                logger.info(
+                    "Background compaction: %s nothing compressible "
+                    "(n=%d, hist~%s tokens) — counter rebased, staying silent",
+                    key, len(_msgs), f"{_hist_est:,}",
+                )
+                return
+
+            # 确实要压了才通知
+            try:
+                await self._send_session_notice(
+                    entry,
+                    f"💤 后台压缩：会话空闲中，正在压缩上下文（~{entry.last_prompt_tokens:,} tokens）…",
+                )
+            except Exception:
+                pass
+
+            # 压缩前再确认一次：等待/加载期间起了 turn 就让路
+            if self._is_session_running(key):
+                logger.info(
+                    "Background compaction: %s has a running turn, yielding", key
+                )
+                return
+
+            _model, _runtime = self._resolve_session_agent_runtime(
+                source=entry.origin, session_key=key, user_config=None,
+            )
+            _session_db = getattr(self, "_session_db", None)
+            _session_db = getattr(_session_db, "_db", _session_db)
+            try:
+                _session_row = await self._session_db.get_session(entry.session_id)
+            except Exception:
+                _session_row = None
+                logger.warning(
+                    "Background compaction: could not load session row for %s; "
+                    "seeding empty system prompt",
+                    entry.session_id,
+                )
+
+            _bg_agent = AIAgent(
+                **_runtime,
+                model=_model,
+                max_iterations=4,
+                quiet_mode=True,
+                skip_memory=True,
+                enabled_toolsets=["memory"],
+                session_id=entry.session_id,
+                session_db=_session_db,
+            )
+            _seed_hygiene_system_prompt(_bg_agent, _session_row)
+            _bg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
+            # 与 hygiene 相同：原地压缩，不为网关会话派生 continuation child
+            _bg_agent.compression_in_place = True
+            _bind = getattr(
+                getattr(_bg_agent, "context_compressor", None),
+                "bind_session_state", None,
+            )
+            if callable(_bind):
+                _bind(_session_db, entry.session_id)
+            # 后台绝对阈值（如 40k）远低于 1M 窗口的原生压缩几何
+            # （threshold=50% 窗口、tail=threshold*target_ratio），不缩放
+            # 整段 transcript 都装得进 tail 预算，compress() 会命中
+            # no_compressible_window 空转。小窗口地板为 75%
+            # （_effective_threshold_percent），按 token_threshold/0.75
+            # 反推窗口，使 threshold_tokens ≈ 后台触发阈值。
+            _bg_tok_thr = int(cfg.get("token_threshold", 0) or 0)
+            if _bg_tok_thr > 0:
+                _comp0 = getattr(_bg_agent, "context_compressor", None)
+                if _comp0 is not None:
+                    _comp0.context_length = max(int(_bg_tok_thr / 0.75), 8192)
+            _bg_agent._end_session_on_close = False
+            _bg_agent._print_fn = lambda *a, **kw: None
+
+            _before = int(entry.last_prompt_tokens or 0)
+            _loop = asyncio.get_running_loop()
+            _fence = CompressionCommitFence()
+            _fut = _loop.run_in_executor(
+                None,
+                lambda: _bg_agent._compress_context(
+                    _msgs, "",
+                    approx_tokens=_before,
+                    commit_fence=_fence,
+                ),
+            )
+
+            # 进度感知等待（语义同 hygiene）：idle 预算从最后一次进度起算，
+            # 流式摘要每 token 续期；总上限兜底，防 trickle stream 吊死。
+            _wait_started = time.monotonic()
+            _compressed = None
+            _timed_out = False
+            while True:
+                _slice = max(_idle_budget - _fence.seconds_since_progress(), 0.005)
+                try:
+                    _compressed, _ = await asyncio.wait_for(
+                        asyncio.shield(_fut), timeout=_slice,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    if (
+                        _fence.seconds_since_progress() < _idle_budget
+                        and time.monotonic() - _wait_started < _total_ceiling
+                    ):
+                        continue
+                    _timed_out = True
+                    break
+
+            if _timed_out:
+                _cancelled = None
+                while _cancelled is None:
+                    if _fence.commit_in_flight:
+                        _cancelled = False
+                        break
+                    _cancelled = _fence.try_cancel_before_commit()
+                    if _cancelled is None:
+                        await asyncio.sleep(0.025)
+                if not _cancelled:
+                    # 超时瞬间恰好越过 commit 边界：按成功消费结果
+                    _compressed, _ = await _fut
+                else:
+                    _fence.release_cancelled_compression_lock()
+                    self._defer_agent_cleanup_until_future_done(
+                        _fut, _bg_agent,
+                        context="background compaction timeout",
+                    )
+                    _cleanup_deferred = True
+                    if _failure_cooldown_seconds >= 0:
+                        _record_hygiene_cooldown(
+                            self, entry.session_id,
+                            _hygiene_cooldown_for_failure(
+                                self, key, _failure_cooldown_seconds,
+                            ),
+                            "background compaction timed out with no output "
+                            "from the summary model",
+                        )
+                    try:
+                        await self._send_session_notice(
+                            entry,
+                            "⚠️ 后台压缩超时（摘要模型无输出），未丢弃任何消息，"
+                            "已冷却延后重试，不影响使用",
+                        )
+                    except Exception:
+                        pass
+                    logger.warning("Background compaction timed out for %s", key)
+                    return
+
+            # 成功返回。轮转（非原地）时先把压缩后 transcript 落库再换绑，
+            # 失败则保持原会话（fail-closed，与 hygiene/#21301 一致）。
+            _new_sid = _bg_agent.session_id
+            _rotated = _new_sid != entry.session_id
+            _in_place = bool(
+                getattr(_bg_agent, "_last_compaction_in_place", False)
+            )
+            if _rotated:
+                if not await self.async_session_store.rewrite_transcript(
+                    _new_sid, _compressed
+                ):
+                    logger.error(
+                        "Background compaction: rewrite_transcript failed for "
+                        "rotated session %s → %s; keeping the original session",
+                        entry.session_id, _new_sid,
+                    )
+                    _rotated = False
+                    _in_place = False
+                else:
+                    entry.session_id = _new_sid
+                    await self.async_session_store._save()
+
+            _comp = getattr(_bg_agent, "context_compressor", None)
+            _aborted = _comp is not None and getattr(
+                _comp, "_last_compress_aborted", False
+            )
+
+            if not _aborted and not _rotated and not _in_place:
+                # 真 no-op（无可压窗口）：静默回写计数，不通知、不记冷却
+                await self.async_session_store.update_session(
+                    key, last_prompt_tokens=_hist_est, touch_activity=False,
+                )
+                logger.info(
+                    "Background compaction: %s no compressible window — "
+                    "counter rebased to ~%s, staying silent",
+                    key, f"{_hist_est:,}",
+                )
+                return
+
+            if _aborted:
+                # abort：什么都没落库 —— 记冷却，防止每分钟重试轰炸
+                _err = (
+                    getattr(_comp, "_last_summary_error", None)
+                    if _comp is not None else None
+                ) or "no-op"
+                if _failure_cooldown_seconds >= 0:
+                    _record_hygiene_cooldown(
+                        self, entry.session_id,
+                        _hygiene_cooldown_for_failure(
+                            self, key, _failure_cooldown_seconds,
+                        ),
+                        getattr(_comp, "_last_summary_error", None)
+                        if _comp is not None else "background compaction no-op",
+                    )
+                from agent.redact import redact_sensitive_text
+                _err = redact_sensitive_text(str(_err), force=True)
+                try:
+                    await self._send_session_notice(
+                        entry,
+                        f"⚠️ 后台压缩未完成（{_err}），未丢弃任何消息，"
+                        "已冷却延后重试，不影响使用",
+                    )
+                except Exception:
+                    pass
+                logger.warning(
+                    "Background compaction aborted/no-op for %s: %s", key, _err,
+                )
+                return
+
+            # 真成功：重置失败阶梯（与 hygiene 同一判定）
+            try:
+                if hygiene_compaction_recovered(
+                    aborted=_aborted,
+                    rotated=_rotated,
+                    in_place=_in_place,
+                    msg_count=len(_msgs),
+                    new_count=len(_compressed),
+                    approx_tokens=_before,
+                    new_tokens=estimate_messages_tokens_rough(_compressed),
+                ):
+                    _reset_hygiene_failure_streak(self, key)
+            except Exception:
+                pass
+
+            _after_tokens = estimate_messages_tokens_rough(_compressed)
+            # 回写 0：扫描不再用陈旧 token 数重复触发；touch_activity=False
+            # 保持空闲计时（否则每次压缩都重置空闲钟，永远压不了第二次）
+            await self.async_session_store.update_session(
+                key, last_prompt_tokens=0, touch_activity=False,
+            )
+            # 驱逐缓存 agent：下一条消息从压缩后的 DB 重建（否则防失忆守卫
+            # 会用内存里的旧长历史把压缩整体回滚）
+            self._evict_cached_agent(key)
+            try:
+                await self._send_session_notice(
+                    entry,
+                    f"✅ 后台压缩完成（~{_before:,} → ~{_after_tokens:,} tokens），"
+                    "上下文已释放，下次回复会更快",
+                )
+            except Exception:
+                pass
+            logger.info(
+                "Background compaction done for %s: ~%s → ~%s tokens",
+                key, f"{_before:,}", f"{_after_tokens:,}",
+            )
+        except Exception as _exc:
+            # 异常也进冷却 —— 无冷却的重试 = 通知轰炸（实测 5 次/4 分钟）
+            try:
+                if _failure_cooldown_seconds >= 0:
+                    _record_hygiene_cooldown(
+                        self, entry.session_id,
+                        _hygiene_cooldown_for_failure(
+                            self, key, _failure_cooldown_seconds,
+                        ),
+                        str(_exc),
+                    )
+            except Exception:
+                pass
+            try:
+                await self._send_session_notice(
+                    entry,
+                    f"⚠️ 后台压缩未完成（{_exc}），下次对话将自动处理，不影响使用",
+                )
+            except Exception:
+                pass
+            logger.warning("Background compaction failed for %s: %s", key, _exc)
+        finally:
+            if _bg_agent is not None and not _cleanup_deferred:
+                try:
+                    await self._cleanup_agent_resources_off_loop(
+                        _bg_agent, context="background compaction",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Background compaction agent cleanup failed",
+                        exc_info=True,
+                    )
+
+    async def _send_session_notice(self, entry: Any, text: str) -> None:
+        """向会话来源发主动提示消息（fail-soft，永不抛出）。"""
+        try:
+            _origin = entry.origin
+            if not _origin or not getattr(_origin, "platform", None):
+                return
+            _adapter = self.adapters.get(_origin.platform)
+            if _adapter is None:
+                return
+            _meta = {}
+            if getattr(_origin, "thread_id", None):
+                _meta["thread_id"] = _origin.thread_id
+            await _adapter.send(_origin.chat_id, text, metadata=_meta)
+        except Exception:
+            logger.debug("Session notice send failed", exc_info=True)
 
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.
