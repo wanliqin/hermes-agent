@@ -293,29 +293,48 @@ def _get_process_start_time(pid: int) -> Optional[int]:
     different value and is never mistaken for the original.
 
     On Linux this is field 22 of ``/proc/<pid>/stat`` (start time in clock
-    ticks since boot, an int).  On platforms without ``/proc`` (macOS, Windows)
-    we fall back to ``psutil.Process(pid).create_time()`` — a float epoch
-    timestamp — quantized to an int (centiseconds) for stable equality.
+    ticks since boot) converted to epoch seconds via ``btime`` from
+    ``/proc/stat``.  On platforms without ``/proc`` (macOS, Windows) we fall
+    back to ``psutil.Process(pid).create_time()`` — a float epoch timestamp —
+    quantized to an int (seconds) for stable equality.
 
-    The two sources are never mixed on a single platform: ``/proc`` always
-    succeeds first on Linux, and always fails on macOS/Windows so psutil is
-    always used there.  Because the guard only compares the value recorded at
-    spawn against the live value *on the same host*, the differing units across
-    platforms are irrelevant — only same-source equality matters.
+    Both sources yield epoch seconds, so the value is directly comparable
+    with the lifecycle sentinel's ``start_time`` (``time.time()``) written by
+    ``lifecycle_ledger.record_startup()`` — same-unit comparison matters
+    there, not just same-source equality.
     """
     stat_path = Path(f"/proc/{pid}/stat")
     try:
-        # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
-        return int(stat_path.read_text(encoding="utf-8").split()[21])
+        # local fix 2026.8.16: comm may contain spaces/parens, so split on the
+        # LAST ')' like drain_control.py and index the tail — field 22 (1-based)
+        # is tail index 19 (upstream #86471)
+        text = stat_path.read_text(encoding="utf-8")
+        tail = text.rsplit(")", 1)[1].split()
+        start_ticks = int(tail[19])
+        # local fix 2026.8.16: convert clock ticks since boot to epoch seconds
+        # (btime + ticks/CLK_TCK) to match lifecycle_ledger's time.time()
+        # sentinel unit (upstream #86469)
+        boot_epoch = None
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                boot_epoch = int(line.split()[1])
+                break
+        if boot_epoch is None:
+            raise ValueError("btime not found in /proc/stat")
+        clk_tck = os.sysconf("SC_CLK_TCK")
+        return int(round(boot_epoch + start_ticks / clk_tck))
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
         pass
 
     # No /proc (macOS / Windows): psutil is a hard dependency and exposes a
-    # cross-platform creation time.  Quantize to centiseconds so repeated reads
-    # of the same process compare equal without float-precision fragility.
+    # cross-platform creation time.  Quantize to whole seconds so repeated
+    # reads of the same process compare equal without float-precision
+    # fragility.
     try:
         import psutil  # type: ignore
-        return int(round(psutil.Process(pid).create_time() * 100))
+        # local fix 2026.8.16: epoch seconds, not centiseconds, to match the
+        # lifecycle sentinel's time.time() unit (upstream #86469)
+        return int(round(psutil.Process(pid).create_time()))
     except Exception:
         return None
 

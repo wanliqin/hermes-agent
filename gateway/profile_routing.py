@@ -143,9 +143,12 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
                 name=name,
                 platform=platform,
                 profile=profile,
-                guild_id=entry.get("guild_id"),
-                chat_id=entry.get("chat_id"),
-                thread_id=entry.get("thread_id"),
+                # local fix 2026.8.16: coerce unquoted numeric YAML IDs to str —
+                # SessionSource fields are str and int != str silently never
+                # matches (upstream #86470)
+                guild_id=str(entry["guild_id"]) if entry.get("guild_id") is not None else None,
+                chat_id=str(entry["chat_id"]) if entry.get("chat_id") is not None else None,
+                thread_id=str(entry["thread_id"]) if entry.get("thread_id") is not None else None,
                 enabled=entry.get("enabled", True),
             )
         )
