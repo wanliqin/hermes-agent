@@ -1129,7 +1129,11 @@ class QQAdapter(BasePlatformAdapter):
 
         chat_type = parsed.get("chat_type", "")
         chat_id = parsed.get("chat_id", "")
-        if chat_type == "c2c":
+        # k6 local fix (ported 2026-08-15): QQ direct-message session keys use
+        # ``dm`` while QQ interaction callbacks report the clicking user via
+        # ``operator_openid``. The session's chat_id is that same user ID, so
+        # require an exact match.
+        if chat_type in {"dm", "c2c"}:
             return bool(chat_id) and operator == chat_id
 
         if chat_type in {"group", "guild"}:
