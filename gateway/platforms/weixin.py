@@ -157,6 +157,10 @@ def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
     if not AIOHTTP_AVAILABLE:
         return None
     ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    # k6 local fix (ported 2026-08-15): 腾讯 CDN (novac2c.cdn.weixin.qq.com) 按
+    # ClientHello cipher 指纹拒绝 Python/aiohttp 默认 cipher 列表
+    # (SSL: SSLV3_ALERT_HANDSHAKE_FAILURE)。实测 DEFAULT@SECLEVEL=1 可握手成功。
+    ssl_ctx.set_ciphers("DEFAULT@SECLEVEL=1")
     return aiohttp.TCPConnector(
         ssl=ssl_ctx,
         # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451, #69089).
