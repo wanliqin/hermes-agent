@@ -900,6 +900,7 @@ def _pack_markdown_blocks_for_weixin(content: str, max_length: int) -> List[str]
 
 def _split_text_for_weixin_delivery(
     content: str, max_length: int, split_per_line: bool = False,
+    merge_short_chat_blocks: bool = False,
 ) -> List[str]:
     """Split content into sequential Weixin messages.
 
@@ -915,6 +916,12 @@ def _split_text_for_weixin_delivery(
     The active mode is controlled via ``config.yaml`` ->
     ``platforms.weixin.extra.split_multiline_messages`` (``true`` / ``false``)
     or the env var ``WEIXIN_SPLIT_MULTILINE_MESSAGES``.
+
+    ``merge_short_chat_blocks=True`` disables the chatty short-block split:
+    any content that fits within ``max_length`` is delivered as exactly one
+    message (fewer iLink sendmessage calls, lower rate-limit exposure).
+    Controlled via ``platforms.weixin.extra.merge_short_chat_blocks`` or the
+    env var ``WEIXIN_MERGE_SHORT_CHAT_BLOCKS``.
     """
     if not content:
         return []
@@ -934,6 +941,8 @@ def _split_text_for_weixin_delivery(
     # content looks like a short chatty exchange, in which case split into
     # separate bubbles for a more natural chat feel.
     if len(content) <= max_length:
+        if merge_short_chat_blocks:
+            return [content]
         return (
             [u for u in _split_delivery_units_for_weixin(content) if u]
             if _should_split_short_chat_block_for_weixin(content)
@@ -1244,6 +1253,11 @@ class WeixinAdapter(BasePlatformAdapter):
         self._split_multiline_messages = _coerce_bool(
             extra.get("split_multiline_messages")
             or os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES"),
+            default=False,
+        )
+        self._merge_short_chat_blocks = _coerce_bool(
+            extra.get("merge_short_chat_blocks")
+            or os.getenv("WEIXIN_MERGE_SHORT_CHAT_BLOCKS"),
             default=False,
         )
 
@@ -1728,6 +1742,7 @@ class WeixinAdapter(BasePlatformAdapter):
     def _split_text(self, content: str) -> List[str]:
         return _split_text_for_weixin_delivery(
             content, self.MAX_MESSAGE_LENGTH, self._split_multiline_messages,
+            self._merge_short_chat_blocks,
         )
 
     def _rate_limit_cooldown_remaining(self) -> float:
