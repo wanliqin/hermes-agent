@@ -176,6 +176,28 @@ def _auto_title_enabled() -> bool:
         return True
 
 
+def _title_response_format_enabled() -> bool:
+    """Return whether to send ``response_format: json_schema`` for titling.
+
+    Some OpenAI-compatible gateways (e.g. Chaitin baizhi
+    ai-api-gateway.app.baizhi.cloud) reject json_schema response_format with
+    ``400001: This response_format type is unavailable now`` (observed 2026-08).
+    Titling still works without it: ``_extract_title_text`` falls back through
+    a loose JSON scan / first-line prose. Set
+    ``auxiliary.title_generation.response_format: false`` to disable.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from utils import is_truthy_value
+
+        config = load_config_readonly()
+        title_config = (config.get("auxiliary") or {}).get("title_generation") or {}
+        return is_truthy_value(title_config.get("response_format"), default=True)
+    except Exception:
+        logger.debug("Failed to read title_generation.response_format", exc_info=True)
+        return True
+
+
 def strip_control_wrappers(text: str) -> str:
     """Remove leading machine-authored control wrappers, including nested ones.
 
@@ -392,6 +414,12 @@ def generate_title(
     ]
 
     try:
+        # Some gateways (e.g. Chaitin baizhi) reject json_schema response_format
+        # (400001). Respect auxiliary.title_generation.response_format: false;
+        # _extract_title_text() loose-scans JSON/prose when schema is omitted.
+        title_extra_body = {}
+        if _title_response_format_enabled():
+            title_extra_body = {"response_format": _TITLE_RESPONSE_FORMAT}
         response = call_llm(
             task="title_generation",
             messages=messages,
@@ -401,7 +429,7 @@ def generate_title(
             temperature=0.3,
             timeout=timeout,
             main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+            extra_body=title_extra_body,
         )
         content = response.choices[0].message.content or ""
         return _clean_title(_extract_title_text(content))
