@@ -5438,8 +5438,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _mark_proven = getattr(server, "_mark_session_proven", None)
             if _mark_proven is not None:
                 _mark_proven()
-            # MCP CallToolResult has .content (list of content blocks) and .isError
-            if result.isError:
+            # MCP CallToolResult has .content (list of content blocks) and
+            # .isError (mcp 1.x) / .is_error (mcp 2.x snake_case rename).
+            if getattr(result, "is_error", getattr(result, "isError", False)):
                 error_text = ""
                 for block in (result.content or []):
                     if getattr(block, "text", None):

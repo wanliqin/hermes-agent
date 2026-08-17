@@ -1742,7 +1742,7 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
     image_mime_types: List[str] = []
     # Use identity, not truthiness: unittest mocks and proxy objects commonly
     # synthesize truthy attributes that were never present in the real result.
-    is_error = getattr(mcp_result, "isError", False) is True
+    is_error = getattr(mcp_result, "is_error", getattr(mcp_result, "isError", False)) is True
     structured: Optional[Dict] = getattr(mcp_result, "structuredContent", None) or None
     text_chunks: List[str] = []
     for part in getattr(mcp_result, "content", []) or []:
