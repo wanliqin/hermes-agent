@@ -729,7 +729,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
             skill_dir = skill_md.parent
 
             try:
-                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
+                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:16000]
                 frontmatter, body = _parse_frontmatter(content)
 
                 if not skill_matches_platform(frontmatter):

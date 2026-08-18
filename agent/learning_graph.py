@@ -130,7 +130,7 @@ def build_skill_nodes(skill_roots: list[tuple[str, Path]]) -> dict[str, SkillNod
         if any(p in {".archive", ".hub", "node_modules", ".git"} for p in skill_md.parts):
             continue
         try:
-            fm = _frontmatter(skill_md.read_text(encoding="utf-8")[:4000])
+            fm = _frontmatter(skill_md.read_text(encoding="utf-8")[:16000])
         except OSError:
             continue
         name = str(fm.get("name") or skill_md.parent.name).strip()
