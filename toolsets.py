@@ -46,13 +46,9 @@ _HERMES_CORE_TOOLS = [
     "vision_analyze", "image_generate",
     # Skills
     "skills_list", "skill_view", "skill_manage",
-    # Browser automation
-    "browser_navigate", "browser_snapshot", "browser_click",
-    "browser_type", "browser_scroll", "browser_back",
-    "browser_press", "browser_get_images",
-    "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-    # replaces other tools when browser.backend is "browser-use"
-    "browser_exec",
+    # 2026-08-20 local patch: built-in browser tools removed from core.
+    # k6 浏览器自动化唯一通道 = AgentBridge MCP（见 config.yaml mcp_servers.agentbridge）。
+    # hermes 升级覆盖本文件后需重新应用（见 skills devops/agentbridge-k6）。
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
@@ -182,11 +178,7 @@ TOOLSETS = {
     "browser": {
         "description": "Browser automation for web interaction (navigate, click, type, scroll, iframes, hold-click) with web search for finding URLs",
         "tools": [
-            "browser_navigate", "browser_snapshot", "browser_click",
-            "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
-            "browser_vision", "browser_console", "browser_cdp",
-            "browser_dialog", "browser_exec", "web_search"
+            "web_search"
         ],
         "includes": []
     },
@@ -396,11 +388,6 @@ TOOLSETS = {
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
-            "browser_navigate", "browser_snapshot", "browser_click",
-            "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
-            "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "browser_exec",
             "todo", "memory",
             "session_search", "clarify",
             "execute_code", "delegate_task",
@@ -429,11 +416,6 @@ TOOLSETS = {
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
-            "browser_navigate", "browser_snapshot", "browser_click",
-            "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
-            "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "browser_exec",
             "todo", "memory",
             "session_search",
             "execute_code", "delegate_task",
@@ -455,11 +437,6 @@ TOOLSETS = {
             # Skills
             "skills_list", "skill_view", "skill_manage",
             # Browser automation
-            "browser_navigate", "browser_snapshot", "browser_click",
-            "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
-            "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "browser_exec",
             # Planning & memory
             "todo", "memory",
             # Session history search

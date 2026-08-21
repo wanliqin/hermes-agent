@@ -178,15 +178,8 @@ except ImportError:
     # harnesses have no mutable registry, so a constant generation is exact.
     def _browser_registry_generation(*, scope=None):
         return (0, 0)
-from plugins.browser.browserbase.provider import (  # noqa: F401  (legacy import surface)
-    BrowserbaseBrowserProvider as BrowserbaseProvider,
-)
-from plugins.browser.browser_use.provider import (  # noqa: F401
-    BrowserUseBrowserProvider as BrowserUseProvider,
-)
-from plugins.browser.firecrawl.provider import (  # noqa: F401
-    FirecrawlBrowserProvider as FirecrawlProvider,
-)
+# 2026-08-21 k6 local patch: plugins/browser/ 已随 AgentBridge 统一清理删除，
+# 三个云后端的 legacy 导入面随之移除（无其他运行时引用，已 grep 确认）。
 from tools.tool_backend_helpers import normalize_browser_cloud_provider
 # Camofox local anti-detection browser backend (optional).
 # When CAMOFOX_URL is set, all browser operations route through the
@@ -728,11 +721,9 @@ def _stop_cdp_supervisor(task_id: str) -> None:
 # wins. This keeps the test surface stable while letting third-party
 # plugins drop in under ``~/.hermes/plugins/browser/<vendor>/``.
 
-_PROVIDER_REGISTRY: Dict[str, type] = {
-    "browserbase": BrowserbaseProvider,
-    "browser-use": BrowserUseProvider,
-    "firecrawl": FirecrawlProvider,
-}
+# 2026-08-21 k6 local patch: 三个内建云后端（plugins/browser/）已删除，注册表置空。
+# 第三方插件仍可通过 ~/.hermes/plugins/browser/<vendor>/ 自注册进来。
+_PROVIDER_REGISTRY: Dict[str, type] = {}
 # Frozen copy of the import-time _PROVIDER_REGISTRY, used by
 # ``_is_legacy_provider_registry_overridden`` to detect test-time
 # monkeypatching. NEVER mutate this dict.
@@ -931,17 +922,9 @@ def _resolve_cloud_provider_uncached() -> Optional[CloudBrowserProvider]:
         # participate only via explicit ``browser.cloud_provider: <name>``,
         # mirroring the firecrawl gate documented on
         # :data:`agent.browser_registry._LEGACY_PREFERENCE`.
-        try:
-            fallback_provider = BrowserUseProvider()
-            if fallback_provider.is_configured():
-                resolved = fallback_provider
-            else:
-                fallback_provider = BrowserbaseProvider()
-                if fallback_provider.is_configured():
-                    resolved = fallback_provider
-        except Exception:  # pragma: no cover - defensive: never poison cache
-            logger.debug("Cloud provider auto-detect failed", exc_info=True)
-            return None
+        # 2026-08-21 k6 local patch: BrowserUse/Browserbase 自动探测随插件删除移除。
+        # 云后端只剩显式 browser.cloud_provider: <name> 注册插件一条路。
+        pass
 
     if resolved is None:
         # Transient None — credentials may self-heal. Don't poison the cache.
