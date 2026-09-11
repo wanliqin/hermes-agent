@@ -523,10 +523,15 @@ def _normalize_string_set(values) -> Set[str]:
 # of pure waste).
 _EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], List[Path]] = {}
 
+# k6 local patch (2026-09-11): autonomous-write allowlist cache.
+# See ``get_external_autonomous_write_dirs`` below.
+_EXTERNAL_AUTONOMOUS_WRITE_CACHE: Dict[Tuple[str, int], List[Path]] = {}
+
 
 def _external_dirs_cache_clear() -> None:
     """Test hook — drop the in-process cache."""
     _EXTERNAL_DIRS_CACHE.clear()
+    _EXTERNAL_AUTONOMOUS_WRITE_CACHE.clear()
     _raw_config_cache_clear()
 
 
@@ -611,6 +616,107 @@ def get_external_skills_dirs() -> List[Path]:
     if cache_key is not None:
         _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
     return result
+
+
+# ── k6 local patch (2026-09-11): autonomous-write allowlist ───────────────
+# Background review keeps everything under ``skills.external_dirs`` read-only,
+# EXCEPT subtrees explicitly listed in ``skills.external_autonomous_write``.
+# That lets a product skill library shared by several Hermes profiles accept
+# autonomous sediment from any of them, without widening the read-only
+# boundary to arbitrary paths (an allowlist entry is ignored unless it is
+# also a configured ``external_dirs`` path).
+def get_external_autonomous_write_dirs() -> List[Path]:
+    """Read ``skills.external_autonomous_write`` from config.yaml.
+
+    Each entry is expanded (``~`` and ``${VAR}``), resolved to an absolute
+    path, and kept only when it exists AND is also listed in
+    ``skills.external_dirs`` (the allowlist can only narrow the external
+    boundary, never widen it).  Cached in-process on config.yaml mtime, same
+    as :func:`get_external_skills_dirs`.
+    """
+    config_path = get_config_path()
+    if not config_path.exists():
+        return []
+
+    try:
+        stat = config_path.stat()
+        cache_key: Optional[Tuple[str, int]] = (str(config_path), stat.st_mtime_ns)
+    except OSError:
+        cache_key = None
+
+    if cache_key is not None:
+        cached = _EXTERNAL_AUTONOMOUS_WRITE_CACHE.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+    parsed = _load_raw_config()
+    if not parsed:
+        return []
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return []
+
+    raw_dirs = skills_cfg.get("external_autonomous_write")
+    if not raw_dirs:
+        result: List[Path] = []
+        if cache_key is not None:
+            _EXTERNAL_AUTONOMOUS_WRITE_CACHE[cache_key] = list(result)
+        return result
+    if isinstance(raw_dirs, str):
+        raw_dirs = [raw_dirs]
+    if not isinstance(raw_dirs, list):
+        return []
+
+    from hermes_constants import get_hermes_home
+
+    hermes_home = get_hermes_home()
+    allowed_roots = set(get_external_skills_dirs())
+    seen: Set[Path] = set()
+    result = []
+    for entry in raw_dirs:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(entry))
+        p = Path(expanded)
+        if not p.is_absolute():
+            p = (hermes_home / p).resolve()
+        else:
+            p = p.resolve()
+        if p not in allowed_roots:
+            logger.debug(
+                "external_autonomous_write entry is not a configured external_dirs "
+                "path, ignoring: %s",
+                p,
+            )
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        result.append(p)
+
+    if cache_key is not None:
+        _EXTERNAL_AUTONOMOUS_WRITE_CACHE[cache_key] = list(result)
+    return result
+
+
+def is_external_autonomous_write_allowed(path) -> bool:
+    """Return True when ``path`` lives under an autonomous-write allowlist dir.
+
+    k6 local patch (2026-09-11): ``_background_review_write_guard`` consults
+    this to let autonomous lifecycle maintenance edit designated external
+    skill libraries (e.g. a product skill library shared across profiles)
+    while every other ``skills.external_dirs`` path stays read-only.
+    Foreground edits are unaffected either way.
+    """
+    candidate = _resolve_for_skill_ownership(path)
+    for root in get_external_autonomous_write_dirs():
+        try:
+            candidate.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def get_all_skills_dirs() -> List[Path]:

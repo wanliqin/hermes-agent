@@ -374,17 +374,42 @@ def _background_review_write_guard(
 
     try:
         from agent.skill_utils import is_external_skill_path
-        if is_external_skill_path(skill_dir):
-            return {
-                "success": False,
-                "error": (
-                    f"Refusing background curator {action} for skill '{name}': "
-                    "the skill lives in skills.external_dirs, which are "
-                    "externally owned and read-only to autonomous curation."
-                ),
-            }
+        external_skill = is_external_skill_path(skill_dir)
     except Exception:
         logger.debug("external skill guard lookup failed for %s", name, exc_info=True)
+        external_skill = False
+
+    # k6 local patch (2026-09-11): ``skills.external_autonomous_write`` lists
+    # subtrees of external_dirs that autonomous maintenance MAY edit (e.g. a
+    # product skill library shared across profiles). An allowlist lookup
+    # failure falls back to the read-only behaviour below (fail-closed).
+    autonomous_ok = False
+    if external_skill:
+        try:
+            from agent.skill_utils import is_external_autonomous_write_allowed
+            autonomous_ok = is_external_autonomous_write_allowed(skill_dir)
+        except Exception:
+            logger.debug(
+                "external autonomous-write allowlist lookup failed for %s", name, exc_info=True
+            )
+            autonomous_ok = False
+
+    if external_skill and not autonomous_ok:
+        return {
+            "success": False,
+            "error": (
+                f"Refusing background curator {action} for skill '{name}': "
+                "the skill lives in skills.external_dirs, which are "
+                "externally owned and read-only to autonomous curation."
+            ),
+        }
+
+    if external_skill and autonomous_ok:
+        # k6 local patch (2026-09-11): an allowlisted external library is
+        # explicitly authorised in config, so autonomous maintenance may edit
+        # it like locally-owned sediment. The pinned guard above still applies,
+        # and builtin/hub/bundled skills never live under external_dirs.
+        return None
 
     try:
         from tools import skill_usage
