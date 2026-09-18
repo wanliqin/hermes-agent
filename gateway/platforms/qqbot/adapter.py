@@ -1131,7 +1131,13 @@ class QQAdapter(BasePlatformAdapter):
 
         chat_type = parsed.get("chat_type", "")
         chat_id = parsed.get("chat_id", "")
-        if chat_type == "c2c":
+        # k6 patch (2026-09-18): QQ builds DM session keys with chat_type="dm"
+        # (see _handle_c2c_message / guild handler) while this guard only
+        # accepted "c2c" — every approve/deny button click in a QQ DM was
+        # rejected as "unauthorized approval click" and the command then timed
+        # out. Accept both spellings; the security property is unchanged
+        # (operator must still equal the DM peer = the session's own user).
+        if chat_type in {"c2c", "dm"}:
             return bool(chat_id) and operator == chat_id
 
         if chat_type in {"group", "guild"}:
