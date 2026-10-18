@@ -616,7 +616,7 @@ class QQAdapter(BasePlatformAdapter):
                         self._log_tag,
                         RATE_LIMIT_DELAY,
                     )
-                    if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
+                    if MAX_RECONNECT_ATTEMPTS is not None and backoff_idx >= MAX_RECONNECT_ATTEMPTS:
                         self._mark_disconnected()
                         return
                     await asyncio.sleep(RATE_LIMIT_DELAY)
@@ -670,7 +670,7 @@ class QQAdapter(BasePlatformAdapter):
                     quick_disconnect_count = 0
                 else:
                     backoff_idx += 1
-                    if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
+                    if MAX_RECONNECT_ATTEMPTS is not None and backoff_idx >= MAX_RECONNECT_ATTEMPTS:
                         logger.error("[%s] Max reconnect attempts reached (QQCloseError)", self._log_tag)
                         self._mark_disconnected()
                         return
@@ -682,7 +682,7 @@ class QQAdapter(BasePlatformAdapter):
                 self._mark_transport_disconnected()
                 self._fail_pending("Connection interrupted")
 
-                if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
+                if MAX_RECONNECT_ATTEMPTS is not None and backoff_idx >= MAX_RECONNECT_ATTEMPTS:
                     logger.error("[%s] Max reconnect attempts reached", self._log_tag)
                     self._mark_disconnected()
                     return
