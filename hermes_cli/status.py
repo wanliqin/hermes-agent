@@ -521,6 +521,48 @@ def show_status(args):
         "Yuanbao": ("YUANBAO_APP_ID", "YUANBAO_HOME_CHANNEL"),
     }
 
+    # 🔴 profile 隔离：以「当前 active profile 的 .env 文件」为唯一真源。
+    #
+    # 本段所有判断都走 os.getenv()，而调用本命令的进程常常继承了**另一个 profile**
+    # （典型是 default）的凭据：systemd 单元、父进程、或 shell 里 export 的
+    # HERMES_HOME 都会带进来。不处理就会把 default 的微信/QQ/钉钉 token
+    # 当成目标 profile 的配置显示出来。
+    #
+    # 2026-11-21 实测：`hermes --profile chaitin-qa status` 显示 QA 也有微信
+    # （home 还是 default 的 o9cq80ye...），但 QA 的 .env 里根本没有 WEIXIN_*。
+    # 只调 load_hermes_dotenv() 不够 —— 它只覆盖 .env 里**存在**的键，
+    # 本 profile 没有的键会继续残留。所以这里改成：
+    #   本 profile .env 里有的键 → 用文件里的值覆盖进程环境
+    #   本 profile .env 里没有的键 → 从进程环境里删掉（判定为别的 profile 泄漏）
+    # 只影响 status 这一个短命进程的输出，不改任何配置文件。
+    try:
+        from dotenv import dotenv_values
+
+        _profile_env_file = get_hermes_home() / ".env"
+        _profile_env = (
+            dotenv_values(_profile_env_file) if _profile_env_file.exists() else {}
+        )
+        _cred_keys: list[str] = []
+        for _t, _h in platforms.values():
+            if _t:
+                _cred_keys.append(_t)
+            if _h:
+                _cred_keys.append(_h)
+        _cred_keys.append("QQ_HOME_CHANNEL")  # 兼容旧变量名
+
+        for _k in _cred_keys:
+            if _k in _profile_env:
+                _v = _profile_env.get(_k)
+                if _v is None or _v == "":
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
+            else:
+                os.environ.pop(_k, None)
+    except Exception:
+        # 任何异常都不能影响 status 输出，退化为原行为
+        pass
+
     for name, (token_var, home_var) in platforms.items():
         token = os.getenv(token_var, "")
         has_token = bool(token)
