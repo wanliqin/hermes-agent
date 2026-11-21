@@ -67,9 +67,71 @@ PyPI 直连在国内是死路（清华 TUNA 0.96s / 官方源 26s+）。
 
 正确顺序：**先读目标函数在新版里的实现 → 再决定要不要移植**。
 
+## 升级后新打的本地补丁
+
+### ② systemd `TimeoutStopSec` 误报（`0002-k6-patch-systemd-TimeoutStopSec-unit.patch`）
+
+**现象**：每次 gateway 启动都报
+
+```
+Stale systemd unit detected: hermes-gateway.service has TimeoutStopSec=90s
+but drain_timeout=180s cron_drain_timeout=30s (expected >=210s)
+```
+
+但 `systemctl show` 实测是 `3min 30s` = 210s，完全合规。
+
+**根因**：`gateway/shutdown_forensics.py` 的 `_systemd_timeout_stop_us()` 先探 `--user` 作用域。
+系统上只有 system 级 unit 时，`systemctl --user show <unit>` **仍以退出码 0 返回**，并打印
+systemd 编译期内置默认值：
+
+```
+LoadState=not-found
+FragmentPath=（空）
+TimeoutStopUSec=1min 30s     ← 这就是那个假的 90s
+```
+
+代码把 90s 当成真实配置 → 恒假报警。
+
+**修法**：查询时一并取 `LoadState`，`not-found` 直接跳过该作用域，继续探下一个。
+
+**验证**：
+
+```python
+from gateway.shutdown_forensics import check_systemd_timing_alignment
+check_systemd_timing_alignment(180.0, 30.0)
+# 修前 {'timeout_stop_sec': 90.0,  'mismatch': True}
+# 修后 {'timeout_stop_sec': 210.0, 'mismatch': False}
+```
+
+### 让 PM 持久化安装 numpy（不改代码，靠插件声明）
+
+`vector_memory` 插件依赖 numpy，但 numpy 不是 hermes-agent 自身依赖。**PM 每次 sync / 装插件都会新建
+`environments/<hash>/venv`，新环境里没有 numpy**，于是向量记忆静默不可用（详见下文坑 1）。
+
+永久修法是让插件自己声明运行时依赖（PM 通过
+`pm.plugin_declarations.read_python_declaration()` 读取），在插件目录放一个 `pyproject.toml`：
+
+```toml
+[project]
+name = "hermes-plugin-vector-memory"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = ["numpy"]
+```
+
+验证 PM 能读到：
+
+```bash
+python -I -c "from pm.plugin_declarations import read_python_declaration; from pathlib import Path; \
+  print(read_python_declaration(Path('/root/.hermes/plugins/vector_memory')).install_requirements)"
+# → ('numpy',)
+```
+
+这样以后每次重建环境都会自动装 numpy，不用再手工补。
+
 ## 坑与修复
 
-### 1. npm 装错目录导致向量记忆不可用
+### 1. numpy 装错目录导致向量记忆不可用
 
 pm 有两层 venv，长得像但完全不同：
 

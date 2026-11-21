@@ -2,7 +2,7 @@ From 510108c9e225a10c7ec191bc5e8c87bf5b88d6f7 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?=E4=B8=87=E9=87=8C=E9=95=BF=E5=9F=8E?=
  <101301319+wanliqin@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 18:43:21 +0800
-Subject: [PATCH] =?UTF-8?q?k6=20patch:=20qqbot=20=E6=97=A0=E9=99=90?=
+Subject: [PATCH 1/2] =?UTF-8?q?k6=20patch:=20qqbot=20=E6=97=A0=E9=99=90?=
  =?UTF-8?q?=E9=87=8D=E8=BF=9E=E7=A7=BB=E6=A4=8D=E5=88=B0=20v0.23.3?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
