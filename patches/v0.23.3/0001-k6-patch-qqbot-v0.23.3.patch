@@ -1,0 +1,68 @@
+From 510108c9e225a10c7ec191bc5e8c87bf5b88d6f7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E4=B8=87=E9=87=8C=E9=95=BF=E5=9F=8E?=
+ <101301319+wanliqin@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 18:43:21 +0800
+Subject: [PATCH 1/4] =?UTF-8?q?k6=20patch:=20qqbot=20=E6=97=A0=E9=99=90?=
+ =?UTF-8?q?=E9=87=8D=E8=BF=9E=E7=A7=BB=E6=A4=8D=E5=88=B0=20v0.23.3?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+原补丁 4ca74dfd64（v0.21.0）在 v0.23.3 上重新移植：
+- plugins/platforms/qqbot/constants.py: MAX_RECONNECT_ATTEMPTS = 100 → None
+- plugins/platforms/qqbot/adapter.py: 4 处守卫（上游 3 处 → 此处 4 处）
+
+上游 v0.23.3 仍是 =100 未修；平台包从 gateway/platforms/ 迁到 plugins/platforms/。
+实测：两个 gateway 进程 QQ 长连接稳定，无重启循环。
+---
+ plugins/platforms/qqbot/adapter.py   | 6 +++---
+ plugins/platforms/qqbot/constants.py | 2 +-
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/plugins/platforms/qqbot/adapter.py b/plugins/platforms/qqbot/adapter.py
+index 36d3554ff14..fed311d3c19 100644
+--- a/plugins/platforms/qqbot/adapter.py
++++ b/plugins/platforms/qqbot/adapter.py
+@@ -373,7 +373,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
+ 
+                 if code == 4008:
+                     logger.info("[%s] Rate limited (4008), waiting %ds", self._log_tag, RATE_LIMIT_DELAY)
+-                    if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
++                    if MAX_RECONNECT_ATTEMPTS is not None and backoff_idx >= MAX_RECONNECT_ATTEMPTS:
+                         self._mark_disconnected()
+                         return
+                     await asyncio.sleep(RATE_LIMIT_DELAY)
+@@ -391,7 +391,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
+                     self._last_seq = None
+ 
+                 await reconnect()
+-                if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
++                if MAX_RECONNECT_ATTEMPTS is not None and backoff_idx >= MAX_RECONNECT_ATTEMPTS:
+                     logger.error("[%s] Max reconnect attempts reached (QQCloseError)", self._log_tag)
+                     self._mark_disconnected()
+                     return
+@@ -403,7 +403,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
+                 self._mark_transport_disconnected()
+                 self._fail_pending("Connection interrupted")
+ 
+-                if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
++                if MAX_RECONNECT_ATTEMPTS is not None and backoff_idx >= MAX_RECONNECT_ATTEMPTS:
+                     logger.error("[%s] Max reconnect attempts reached", self._log_tag)
+                     self._mark_disconnected()
+                     return
+diff --git a/plugins/platforms/qqbot/constants.py b/plugins/platforms/qqbot/constants.py
+index 8a203dea6ab..9a45a1b556d 100644
+--- a/plugins/platforms/qqbot/constants.py
++++ b/plugins/platforms/qqbot/constants.py
+@@ -19,7 +19,7 @@ DEFAULT_API_TIMEOUT = 30.0
+ FILE_UPLOAD_TIMEOUT = 120.0
+ CONNECT_TIMEOUT_SECONDS = 20.0
+ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+-MAX_RECONNECT_ATTEMPTS = 100
++MAX_RECONNECT_ATTEMPTS = None  # k6 patch: None = 无限重试，网络恢复后自动连回
+ RATE_LIMIT_DELAY = 60  # seconds
+ QUICK_DISCONNECT_THRESHOLD = 5.0  # seconds
+ MAX_QUICK_DISCONNECT_COUNT = 3
+-- 
+2.34.1
+

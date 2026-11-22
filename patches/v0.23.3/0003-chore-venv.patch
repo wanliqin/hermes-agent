@@ -1,0 +1,30 @@
+From 37f0e42f936b6955f26e1a5209ad4e99e9feebb8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E4=B8=87=E9=87=8C=E9=95=BF=E5=9F=8E?=
+ <101301319+wanliqin@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:13:45 +0800
+Subject: [PATCH 3/4] =?UTF-8?q?chore:=20=E5=BF=BD=E7=95=A5=E6=9C=AC?=
+ =?UTF-8?q?=E5=9C=B0=20venv=20=E5=85=BC=E5=AE=B9=E8=BD=AF=E9=93=BE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+/venv -> venv313 是 2026-08 留下的本地软链，未纳入版本控制但一直显示为
+untracked，干扰 git status。加规则忽略。
+---
+ .gitignore | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/.gitignore b/.gitignore
+index aa9b27899a5..5d480a95627 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -339,3 +339,6 @@ infografico/
+ /pm/.lock.json.lock
+ 
+ apps/desktop/.dist-build*
++
++# k6: 本地兼容软链（venv -> venv313），不纳入版本控制
++/venv
+-- 
+2.34.1
+

@@ -1,0 +1,308 @@
+From 120c74308520a81f91acedc937edae5f06db72f1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E4=B8=87=E9=87=8C=E9=95=BF=E5=9F=8E?=
+ <101301319+wanliqin@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:59:39 +0800
+Subject: [PATCH 4/4] fix(dingtalk): validate business ack and isolate
+ reactions
+
+---
+ plugins/platforms/dingtalk/adapter.py |  54 +++++++----
+ tests/gateway/test_dingtalk.py        | 133 +++++++++++++++++++++++++-
+ 2 files changed, 168 insertions(+), 19 deletions(-)
+
+diff --git a/plugins/platforms/dingtalk/adapter.py b/plugins/platforms/dingtalk/adapter.py
+index 6b7a34bb1eb..eaa4cf122aa 100644
+--- a/plugins/platforms/dingtalk/adapter.py
++++ b/plugins/platforms/dingtalk/adapter.py
+@@ -214,9 +214,11 @@ class DingTalkAdapter(BasePlatformAdapter):
+         self._robot_code: str = extra.get("robot_code") or self._client_id
+         self._dedup = MessageDeduplicator(max_size=1000)
+         self._session_webhooks: dict[str, tuple[str, int]] = {}  # chat_id -> (webhook, expired_time_ms)
+-        self._message_contexts: dict[str, Any] = {}  # chat_id -> last inbound ChatbotMessage (per-chat: no clobber)
++        self._message_contexts: dict[str, Any] = {}  # chat_id -> last inbound ChatbotMessage (fallback only)
++        self._message_contexts_by_id: dict[str, Any] = {}  # message_id -> exact inbound message
++        self._card_inbound_message_ids: dict[str, str] = {}  # out_track_id -> triggering message_id
+         self._card_template_id: Optional[str] = extra.get("card_template_id")
+-        self._done_emoji_fired: set[str] = set()  # chats whose Done reaction fired this turn; reset per inbound
++        self._done_emoji_fired: set[str] = set()  # exact inbound message_ids whose Done reaction fired
+         # Open streaming cards: chat_id -> {out_track_id: last_content}. ``edit_message(finalize=False)``
+         # re-opens a finalized card, so we track them and auto-close as siblings on the next ``send()``.
+         self._streaming_cards: dict[str, dict[str, str]] = {}
+@@ -372,7 +374,7 @@ class DingTalkAdapter(BasePlatformAdapter):
+         if self._http_client:
+             await self._http_client.aclose()
+         self._http_client = self._stream_client = None
+-        for store in (self._session_webhooks, self._message_contexts, self._streaming_cards, self._done_emoji_fired, self._dedup, self._bg_tasks):
++        for store in (self._session_webhooks, self._message_contexts, self._message_contexts_by_id, self._card_inbound_message_ids, self._streaming_cards, self._done_emoji_fired, self._dedup, self._bg_tasks):
+             store.clear()
+         logger.info("[%s] Disconnected", self.name)
+ 
+@@ -436,21 +438,23 @@ class DingTalkAdapter(BasePlatformAdapter):
+         cards = self._streaming_cards.pop(chat_id, None)
+         token = await self._get_access_token() if cards else None
+         for out_track_id, last_content in list(cards.items()) if token else ():
++            self._card_inbound_message_ids.pop(out_track_id, None)
+             try:
+                 await self._stream_card_content(out_track_id, token, last_content, finalize=True)
+                 logger.debug("[%s] AI Card sibling closed: %s", self.name, out_track_id)
+             except Exception as e:
+                 logger.debug("[%s] Sibling close failed for %s: %s", self.name, out_track_id, e)
+ 
+-    def _fire_done_reaction(self, chat_id: str) -> None:
+-        """Swap 🤔Thinking → 🥳Done on the original user message; idempotent per chat_id."""
+-        if chat_id in self._done_emoji_fired:
++    def _fire_done_reaction(self, chat_id: str, message_id: Optional[str] = None) -> None:
++        """Swap Thinking → Done on the exact triggering message, not a later chat sibling."""
++        reaction_key = message_id or chat_id
++        if reaction_key in self._done_emoji_fired:
+             return
+-        self._done_emoji_fired.add(chat_id)
+-        msg = self._message_contexts.get(chat_id)
++        msg = self._message_contexts_by_id.get(message_id) if message_id else self._message_contexts.get(chat_id)
+         msg_id, conversation_id = (getattr(msg, "message_id", None) or "", getattr(msg, "conversation_id", None) or "") if msg else ("", "")
+         if not (msg_id and conversation_id):
+             return
++        self._done_emoji_fired.add(reaction_key)
+         async def _swap() -> None:
+             await self._send_emotion(msg_id, conversation_id, t("platform.dingtalk.emotion.thinking"), recall=True)
+             await self._send_emotion(msg_id, conversation_id, t("platform.dingtalk.emotion.done"), recall=False)
+@@ -469,10 +473,12 @@ class DingTalkAdapter(BasePlatformAdapter):
+             return logger.debug("[%s] Dropping message from non-allowlisted user staff_id=%s sender_id=%s", self.name, sender_staff_id, sender_id)
+         if not self._should_process_message(message, self._extract_text(message) or "", is_group, chat_id):  # wake-word gate needs text early
+             return logger.debug("[%s] Dropping group message that failed mention gate message_id=%s chat_id=%s", self.name, msg_id, chat_id)
+-        # Per-chat context; reset the Done marker so this message gets its own Thinking→Done cycle.
++        # Keep a per-chat fallback for intermediate sends, plus the exact message for final replies.
+         if chat_id:
+             self._message_contexts[chat_id] = message
+-            self._done_emoji_fired.discard(chat_id)
++        if len(self._message_contexts_by_id) >= 1000:
++            self._message_contexts_by_id.pop(next(iter(self._message_contexts_by_id)))
++        self._message_contexts_by_id[msg_id] = message
+         session_webhook = getattr(message, "session_webhook", None) or ""
+         if session_webhook and chat_id and _DINGTALK_WEBHOOK_RE.match(session_webhook):
+             if len(self._session_webhooks) >= _SESSION_WEBHOOKS_MAX:
+@@ -483,6 +489,9 @@ class DingTalkAdapter(BasePlatformAdapter):
+         msg_type, media_urls, media_types = self._extract_media(message)
+         if not text and not media_urls:
+             return logger.debug("[%s] Empty message, skipping", self.name)
++        # Only accepted, non-duplicate content gets a Thinking reaction.
++        if conversation_id:
++            self._spawn_bg(self._send_emotion(msg_id, conversation_id, t("platform.dingtalk.emotion.thinking"), recall=False))
+         source = self.build_source(chat_id=chat_id, chat_name=getattr(message, "conversation_title", None), chat_type="group" if is_group else "dm",
+                                    user_id=sender_id, user_name=sender_nick, user_id_alt=sender_staff_id if sender_staff_id else None,
+                                    message_id=msg_id)
+@@ -510,19 +519,22 @@ class DingTalkAdapter(BasePlatformAdapter):
+             return SendResult(success=False, error="No valid session_webhook available. Reply must follow an incoming message.")
+         if not self._http_client:
+             return SendResult(success=False, error="HTTP client not initialized")
+-        current_message = self._message_contexts.get(chat_id)
++        current_message = (self._message_contexts_by_id.get(reply_to) if reply_to else None) or self._message_contexts.get(chat_id)
+         # ``reply_to`` is only set by base.py:_send_with_retry for the FINAL reply to an inbound message;
+         # tool-progress, commentary and stream first-sends leave it None. It decides (1) finalize-on-create
+-        # (intermediate cards stay open so edits don't flicker) and (2) whether to fire the Done reaction.
++        # (intermediate cards stay open so edits don't flicker) and (2) which message gets the Done reaction.
+         is_final_reply = reply_to is not None
+         if self._card_template_id and current_message and self._card_sdk:
+             await self._close_streaming_siblings(chat_id)  # close lingering tool-progress cards before creating a new one
+             result = await self._create_and_stream_card(chat_id, current_message, content, finalize=is_final_reply)
+             if result and result.success:
+                 if is_final_reply:
+-                    self._fire_done_reaction(chat_id)
++                    self._fire_done_reaction(chat_id, reply_to)
+                 else:  # keep open + track so the next send() auto-closes it, or edit_message(finalize=True) does
+                     self._streaming_cards.setdefault(chat_id, {})[result.message_id] = content
++                    inbound_id = getattr(current_message, "message_id", None) or ""
++                    if inbound_id:
++                        self._card_inbound_message_ids[result.message_id] = inbound_id
+                 return result
+             logger.warning("[%s] AI Card send failed, falling back to webhook", self.name)
+         logger.debug("[%s] Sending via webhook", self.name)
+@@ -530,8 +542,16 @@ class DingTalkAdapter(BasePlatformAdapter):
+         try:
+             resp = await self._http_client.post(session_webhook, json=payload, timeout=15.0)
+             if resp.status_code < 300:
++                try:
++                    response_data = resp.json()
++                except (ValueError, TypeError):
++                    response_data = None
++                if isinstance(response_data, dict) and response_data.get("errcode") not in (None, 0, "0"):
++                    code, errmsg = response_data.get("errcode"), str(response_data.get("errmsg") or "unknown")[:200]
++                    logger.warning("[%s] Send failed with DingTalk errcode=%s: %s", self.name, code, errmsg)
++                    return SendResult(success=False, error=f"DingTalk errcode={code}: {errmsg}")
+                 if is_final_reply:
+-                    self._fire_done_reaction(chat_id)
++                    self._fire_done_reaction(chat_id, reply_to)
+                 return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+             logger.warning("[%s] Send failed HTTP %d: %s", self.name, resp.status_code, resp.text[:200])
+             return SendResult(success=False, error=f"HTTP {resp.status_code}: {resp.text[:200]}")
+@@ -616,7 +636,8 @@ class DingTalkAdapter(BasePlatformAdapter):
+                 if not self._streaming_cards.get(chat_id):
+                     self._streaming_cards.pop(chat_id, None)
+                 logger.debug("[%s] AI Card finalized (edit): %s", self.name, message_id)
+-                self._fire_done_reaction(chat_id)
++                inbound_id = self._card_inbound_message_ids.pop(message_id, None)
++                self._fire_done_reaction(chat_id, inbound_id)
+             else:  # non-final edit reopens the card into streaming state — track for sibling close
+                 self._streaming_cards.setdefault(chat_id, {})[message_id] = content
+             return SendResult(success=True, message_id=message_id)
+@@ -731,9 +752,6 @@ class _IncomingHandler(dingtalk_stream.ChatbotHandler if DINGTALK_STREAM_AVAILAB
+                 chatbot_msg.session_webhook = webhook
+             if not getattr(chatbot_msg, "is_in_at_list", False) and data.get("isInAtList"):
+                 chatbot_msg.is_in_at_list = True
+-            msg_id, conversation_id = getattr(chatbot_msg, "message_id", None) or "", getattr(chatbot_msg, "conversation_id", None) or ""
+-            if msg_id and conversation_id:
+-                self._adapter._spawn_bg(self._adapter._send_emotion(msg_id, conversation_id, t("platform.dingtalk.emotion.thinking"), recall=False))
+             asyncio.create_task(self._safe_on_message(chatbot_msg))  # surfaces exceptions in logs instead of losing them
+         except Exception:
+             logger.exception("[%s] Error preparing incoming message", self._adapter.name)
+diff --git a/tests/gateway/test_dingtalk.py b/tests/gateway/test_dingtalk.py
+index 645baa9c4bb..51f9679b6e1 100644
+--- a/tests/gateway/test_dingtalk.py
++++ b/tests/gateway/test_dingtalk.py
+@@ -589,7 +589,7 @@ class TestCardLifecycle:
+         """Stream consumer's final edit_message(finalize=True) fires Done."""
+         a = adapter_with_card
+         fired: list[str] = []
+-        a._fire_done_reaction = lambda cid: fired.append(cid)
++        a._fire_done_reaction = lambda cid, message_id=None: fired.append(cid)
+ 
+         await a.send("chat-1", "initial")
+         # Reopen via edit_message(finalize=False) then close.
+@@ -634,3 +634,134 @@ class TestCardLifecycle:
+ # ---------------------------------------------------------------------------
+ # AI Card Tests
+ # ---------------------------------------------------------------------------
++
++
++# ---------------------------------------------------------------------------
++# Business ACK and exact message reaction ownership
++# ---------------------------------------------------------------------------
++
++class TestBusinessAckAndReactionOwnership:
++
++    @pytest.mark.asyncio
++    async def test_http_200_with_nonzero_errcode_is_a_failed_send(self):
++        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        response = MagicMock(status_code=200, text='{"errcode":400,"errmsg":"invalid"}')
++        response.json.return_value = {"errcode": 400, "errmsg": "invalid"}
++        adapter._http_client = AsyncMock()
++        adapter._http_client.post = AsyncMock(return_value=response)
++
++        result = await adapter.send(
++            "chat-1", "answer",
++            metadata={"session_webhook": "https://api.dingtalk.com/x"},
++        )
++
++        assert result.success is False
++        assert "errcode=400" in result.error
++
++    @pytest.mark.asyncio
++    async def test_done_reaction_uses_exact_reply_message(self):
++        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        first = SimpleNamespace(message_id="msg-1", conversation_id="chat-1")
++        second = SimpleNamespace(message_id="msg-2", conversation_id="chat-1")
++        adapter._message_contexts_by_id = {"msg-1": first, "msg-2": second}
++        adapter._message_contexts["chat-1"] = second
++        response = MagicMock(status_code=200)
++        response.json.return_value = {"errcode": 0, "errmsg": "ok"}
++        adapter._http_client = AsyncMock()
++        adapter._http_client.post = AsyncMock(return_value=response)
++        calls = []
++
++        async def fake_emotion(msg_id, conversation_id, emoji_name, *, recall=False):
++            calls.append((msg_id, conversation_id, recall))
++
++        adapter._send_emotion = fake_emotion
++        result = await adapter.send(
++            "chat-1", "answer", reply_to="msg-1",
++            metadata={"session_webhook": "https://api.dingtalk.com/x"},
++        )
++        if adapter._bg_tasks:
++            await asyncio.gather(*list(adapter._bg_tasks))
++
++        assert result.success is True
++        assert len(calls) == 2
++        assert {call[0] for call in calls} == {"msg-1"}
++        assert all(call[1] == "chat-1" for call in calls)
++
++    @pytest.mark.asyncio
++    async def test_missing_exact_message_does_not_use_later_chat_sibling(self):
++        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
++        adapter._message_contexts["chat-1"] = SimpleNamespace(
++            message_id="later-message", conversation_id="chat-1",
++        )
++        adapter._send_emotion = AsyncMock()
++
++        adapter._fire_done_reaction("chat-1", "missing-message")
++        await asyncio.sleep(0)
++
++        adapter._send_emotion.assert_not_called()
++        assert not adapter._bg_tasks
++
++
++class TestThinkingReactionGate:
++
++    @staticmethod
++    def _message(*, mentioned=False):
++        return SimpleNamespace(
++            message_id="msg-1",
++            conversation_id="chat-1",
++            conversation_type="2",
++            sender_id="user-1",
++            sender_staff_id="staff-1",
++            sender_nick="user",
++            text={"content": "hello"},
++            rich_text_content=None,
++            rich_text=None,
++            image_content=None,
++            extensions={},
++            message_type="text",
++            session_webhook="",
++            session_webhook_expired_time=0,
++            create_at=0,
++            conversation_title="group",
++            is_in_at_list=mentioned,
++        )
++
++    @pytest.mark.asyncio
++    async def test_non_mentioned_group_message_gets_no_thinking_reaction(self):
++        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(
++            enabled=True, extra={"require_mention": True},
++        ))
++        adapter._send_emotion = AsyncMock()
++        adapter._resolve_media_codes = AsyncMock()
++        adapter.handle_message = AsyncMock()
++
++        await adapter._on_message(self._message(mentioned=False))
++
++        adapter._send_emotion.assert_not_called()
++        adapter.handle_message.assert_not_called()
++
++    @pytest.mark.asyncio
++    async def test_accepted_group_message_gets_thinking_after_gate(self):
++        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
++        adapter = DingTalkAdapter(PlatformConfig(
++            enabled=True, extra={"require_mention": True},
++        ))
++        calls = []
++
++        async def fake_emotion(msg_id, conversation_id, emoji_name, *, recall=False):
++            calls.append((msg_id, conversation_id, recall))
++
++        adapter._send_emotion = fake_emotion
++        adapter._resolve_media_codes = AsyncMock()
++        adapter.handle_message = AsyncMock()
++
++        await adapter._on_message(self._message(mentioned=True))
++        if adapter._bg_tasks:
++            await asyncio.gather(*list(adapter._bg_tasks))
++
++        assert calls == [("msg-1", "chat-1", False)]
++        adapter.handle_message.assert_awaited_once()
+-- 
+2.34.1
+
