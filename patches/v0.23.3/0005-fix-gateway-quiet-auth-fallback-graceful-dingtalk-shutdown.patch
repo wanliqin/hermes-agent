@@ -1,0 +1,173 @@
+From ed08327df4a399c2d97d2273f496ed1230e968ba Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E4=B8=87=E9=87=8C=E9=95=BF=E5=9F=8E?=
+ <101301319+wanliqin@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:26:41 +0800
+Subject: [PATCH] fix(gateway): quiet auth fallback and graceful DingTalk
+ shutdown
+
+---
+ hermes_cli/auth.py                            | 23 +++++++++++++------
+ plugins/platforms/dingtalk/adapter.py         | 16 +++++++++----
+ tests/gateway/test_dingtalk.py                | 12 ++++++++++
+ .../test_auth_store_read_failure.py           | 10 ++++++++
+ .../hermes_cli/test_global_auth_store_memo.py |  4 ++--
+ 5 files changed, 51 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 293698fee8f..26cbac1d309 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -528,7 +528,7 @@ def _load_global_auth_store() -> dict[str, Any]:
+         except Exception:
+             pass
+     try:
+-        store = _load_auth_store(global_path)
++        store = _load_auth_store(global_path, quiet=True)
+     except Exception:
+         _global_auth_store_cache = None
+         return {}
+@@ -725,7 +725,7 @@ def _empty_auth_store() -> dict[str, Any]:
+     return {"version": AUTH_STORE_VERSION, "providers": {}}
+ 
+ 
+-def _load_auth_store(auth_file: Optional[Path] = None) -> dict[str, Any]:
++def _load_auth_store(auth_file: Optional[Path] = None, *, quiet: bool = False) -> dict[str, Any]:
+     auth_file = auth_file or _auth_file_path()
+     if not auth_file.exists():
+         return _empty_auth_store()
+@@ -734,13 +734,22 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> dict[str, Any]:
+     except OSError:
+         # Exists but unreadable (EMFILE, EACCES, EIO, stalled mount): contents are not bad, and this
+         # module read-modify-writes everywhere, so an empty store here is one _save_auth_store()
+-        # away from erasing every credential. Fail loudly.
+-        logger.warning(
+-            "auth: could not read %s, leaving the store on disk untouched "
+-            "rather than degrading to an empty one",
+-            auth_file, exc_info=True)
++        # away from erasing every credential. The primary store fails loudly; an optional global
++        # fallback stays quiet because profile operation must not depend on that file being visible.
++        if quiet:
++            logger.debug("auth: optional auth store %s is unreadable; skipping", auth_file, exc_info=True)
++        else:
++            logger.warning(
++                "auth: could not read %s, leaving the store on disk untouched "
++                "rather than degrading to an empty one",
++                auth_file, exc_info=True)
+         raise
+     except Exception as exc:
++        if quiet:
++            # Optional profile-to-global fallback is genuinely read-only: do not create a .corrupt
++            # sidecar or warn when hardening deliberately exposes the global file as empty.
++            logger.debug("auth: optional auth store %s is invalid; skipping", auth_file, exc_info=True)
++            return _empty_auth_store()
+         # Genuine corruption: unparseable JSON or non-UTF-8 bytes. Preserve a copy, but never
+         # advertise a backup that was not written.
+         corrupt_path = auth_file.with_suffix(".json.corrupt")
+diff --git a/plugins/platforms/dingtalk/adapter.py b/plugins/platforms/dingtalk/adapter.py
+index eaa4cf122aa..175eb76fd88 100644
+--- a/plugins/platforms/dingtalk/adapter.py
++++ b/plugins/platforms/dingtalk/adapter.py
+@@ -90,9 +90,9 @@ class _SdkLogGuard(logging.Filter):
+     retry loop — a malformed call that also triggers stdlib "--- Logging error ---" tracebacks.
+     """
+ 
+-    def __init__(self, on_exception=None, window: float = _SDK_LOG_REPEAT_WINDOW):
++    def __init__(self, on_exception=None, window: float = _SDK_LOG_REPEAT_WINDOW, is_active=None):
+         super().__init__()
+-        self._on_exception, self._window = on_exception, window
++        self._on_exception, self._window, self._is_active = on_exception, window, is_active
+         self._seen: dict[tuple, list] = {}  # key -> [last_emitted_monotonic, suppressed_count]
+ 
+     def filter(self, record: logging.LogRecord) -> bool:
+@@ -103,6 +103,10 @@ class _SdkLogGuard(logging.Filter):
+                 args = record.args if isinstance(record.args, tuple) else (record.args,)
+                 msg = " ".join(str(x) for x in (record.msg, *args))
+                 record.msg, record.args = msg, ()
++            # Closing the SDK socket during an intentional gateway stop is not a network failure.
++            # Suppress its shutdown ERROR/WARNING records before they reach errors.log.
++            if self._is_active is not None and not self._is_active() and record.levelno >= logging.WARNING:
++                return False
+             exc = record.exc_info[1] if record.exc_info else None
+             if exc is not None and self._on_exception is not None:
+                 self._on_exception(exc)
+@@ -273,7 +277,7 @@ class DingTalkAdapter(BasePlatformAdapter):
+         sdk_logger = getattr(self._stream_client, "logger", None)
+         if not isinstance(sdk_logger, logging.Logger):
+             sdk_logger = logging.getLogger("dingtalk_stream.client")
+-        guard = _SdkLogGuard(self._on_sdk_error)
++        guard = _SdkLogGuard(self._on_sdk_error, is_active=lambda: bool(self._running))
+         sdk_logger.addFilter(guard)
+         try:
+             await self._run_stream_loop()
+@@ -356,10 +360,12 @@ class DingTalkAdapter(BasePlatformAdapter):
+             await self._quiet(websocket.close(), "[%s] websocket close during disconnect failed: %s")
+         if self._stream_task:
+             if hasattr(self._stream_client, "close"):
+-                await self._quiet(asyncio.to_thread(self._stream_client.close))  # sync close() may block on I/O
++                # The gateway's outer adapter deadline is 5s. Bound each inner wait to 2s so
++                # a slow SDK close cannot consume the entire outer budget and trigger a false alarm.
++                await self._quiet(asyncio.wait_for(asyncio.to_thread(self._stream_client.close), timeout=2.0))
+             self._stream_task.cancel()
+             try:
+-                await asyncio.wait_for(self._stream_task, timeout=5.0)
++                await asyncio.wait_for(self._stream_task, timeout=2.0)
+             except (TimeoutError, asyncio.CancelledError):
+                 logger.debug("[%s] stream task did not exit cleanly during disconnect", self.name)
+             self._stream_task = None
+diff --git a/tests/gateway/test_dingtalk.py b/tests/gateway/test_dingtalk.py
+index 51f9679b6e1..e2dda73b40f 100644
+--- a/tests/gateway/test_dingtalk.py
++++ b/tests/gateway/test_dingtalk.py
+@@ -765,3 +765,15 @@ class TestThinkingReactionGate:
+ 
+         assert calls == [("msg-1", "chat-1", False)]
+         adapter.handle_message.assert_awaited_once()
++
++
++def test_sdk_log_guard_silences_errors_during_intentional_disconnect():
++    import logging
++    from plugins.platforms.dingtalk.adapter import _SdkLogGuard
++
++    record = logging.LogRecord(
++        "dingtalk_stream.client", logging.ERROR, __file__, 1,
++        "[start] network exception during socket shutdown", (), None,
++    )
++    assert _SdkLogGuard(is_active=lambda: False).filter(record) is False
++    assert _SdkLogGuard(is_active=lambda: True).filter(record) is True
+diff --git a/tests/hermes_cli/test_auth_store_read_failure.py b/tests/hermes_cli/test_auth_store_read_failure.py
+index c9e575f41ba..d1efd41be1c 100644
+--- a/tests/hermes_cli/test_auth_store_read_failure.py
++++ b/tests/hermes_cli/test_auth_store_read_failure.py
+@@ -67,3 +67,13 @@ def test_unparseable_json_still_degrades_and_preserves_a_copy(store_file):
+ def test_healthy_store_is_returned_unchanged(store_file):
+     result = auth._load_auth_store(store_file)
+     assert result["providers"]["nous"]["api_key"] == "secret"
++
++
++def test_optional_invalid_store_is_quiet_and_read_only(store_file, caplog):
++    store_file.write_text("{ not json", encoding="utf-8")
++
++    result = auth._load_auth_store(store_file, quiet=True)
++
++    assert result == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
++    assert not store_file.with_suffix(".json.corrupt").exists()
++    assert not caplog.records, "optional fallback must not emit a corruption warning"
+diff --git a/tests/hermes_cli/test_global_auth_store_memo.py b/tests/hermes_cli/test_global_auth_store_memo.py
+index 288213ad667..57bc1e2d5cb 100644
+--- a/tests/hermes_cli/test_global_auth_store_memo.py
++++ b/tests/hermes_cli/test_global_auth_store_memo.py
+@@ -67,9 +67,9 @@ class TestLoadGlobalAuthStoreMemo:
+         reads = {"n": 0}
+         orig = auth_mod._load_auth_store
+ 
+-        def counting_load(store_path=None):
++        def counting_load(store_path=None, **kwargs):
+             reads["n"] += 1
+-            return orig(store_path)
++            return orig(store_path, **kwargs)
+ 
+         monkeypatch.setattr(auth_mod, "_load_auth_store", counting_load)
+ 
+-- 
+2.34.1
+
